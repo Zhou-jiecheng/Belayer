@@ -1,0 +1,11 @@
+rjob submit --name=prime-code-fault-inject --gpu=8 --memory=1500000 --cpu=128 \
+--charged-group=stu --private-machine=group \
+--mount=gpfs://gpfs1/ailab-sys:/mnt/shared-storage-user/ailab-sys \
+--image=registry.h.pjlab.org.cn/ailab-sys-sys_gpu/slime-dev:prime_multi_turn \
+-P 1 \
+--host-network=true \
+--negative-tags node/gpu-lg-cmc-h-h200-1113.host.h.pjlab.org.cn \
+--custom-resources rdma/mlnx_shared=8 \
+--custom-resources mellanox.com/mlnx_rdma=1 \
+-e DISTRIBUTED_JOB=true \
+-- bash -exc /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/fault-inject-slime/examples/prime_code_multi_turn/entrypoint.sh
