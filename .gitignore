@@ -4,6 +4,20 @@ swe-rl/docs/log_passrate_plan.md
 swe-rl/scripts/logs
 swe.pem
 __pycache__/
+workdir/
+fault-inject-slime/
+gui-rl/
+data/
+codex_files/
+openclaw/
+openclaw-combine/
+openclaw-opd/
+openclaw-rl/
+openclaw-test/
+terminal-rl/
+toolcall-rl/
+checkpoint-engine/.git.disabled/
+sglang/.git.disabled/
 *.pyc
 logs
 .DS_Store
@@ -223,5 +237,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+./modified_sglang/
 # Streamlit
 .streamlit/secrets.toml
