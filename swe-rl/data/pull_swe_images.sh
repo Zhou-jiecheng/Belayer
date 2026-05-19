@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-TRAIN=${TRAIN:-${HOME}/data/swe_gym_subset/train.jsonl}
+TRAIN=${TRAIN:-/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/data/train.jsonl}
 N=${N:-0}   # 0 = all
 # Legacy global overrides (if set, used for all datasets)
 PROXY_PREFIX=${PROXY_PREFIX:-}
@@ -66,13 +66,13 @@ def resolve_image(record):
     if "swe-bench" in data_source:
         # Docker doesn't allow double underscore for SWE-bench images.
         iid_compatible = iid.replace("__", "_1776_").lower()
-        img_name = f"sweb.eval.x86_64.{iid_compatible}:latest"
+        img_name = f"sweb.eval.x86_64.{iid_compatible}"
         proxy = proxy_sb
         src_pfx = src_sb
     else:
         # SWE-Gym naming convention.
         iid_compatible = iid.replace("__", "_s_").lower()
-        img_name = f"sweb.eval.x86_64.{iid_compatible}:latest"
+        img_name = f"sweb.eval.x86_64.{iid_compatible}"
         proxy = proxy_gym
         src_pfx = src_gym
 

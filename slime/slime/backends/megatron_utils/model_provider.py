@@ -81,6 +81,8 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
+        import megatron.bridge.models.qwen.qwen3_bridge  # noqa: F401
+        import megatron.bridge.models.qwen_vl.qwen3_vl_bridge  # noqa: F401
         from megatron.bridge import AutoBridge
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)

@@ -153,6 +153,25 @@ _post_actors: list[object] = []
 _post_actor_idx: int = 0
 
 
+def _extract_output_ids_from_meta_info(meta_info: dict) -> list[int]:
+    output_token_logprobs = meta_info.get("output_token_logprobs") or []
+    if not isinstance(output_token_logprobs, list):
+        return []
+
+    output_ids = []
+    for entry in output_token_logprobs:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            output_ids.append(entry[1])
+    return output_ids
+
+
+def _extract_chunk_output_ids(data: dict, meta_info: dict) -> list[int]:
+    output_ids = data.get("output_ids") or []
+    if output_ids:
+        return output_ids
+    return _extract_output_ids_from_meta_info(meta_info)
+
+
 def _next_actor():
     global _post_actor_idx
     if not _post_actors:
@@ -196,6 +215,134 @@ async def _post(client, url, payload, max_retries=60):
         break
 
     return output
+
+
+async def _post_stream(client, url, payload, max_retries=60):
+    retry_count = 0
+    while retry_count < max_retries:
+        response = None
+        try:
+            aggregated_output_ids = []
+            aggregated_output_token_logprobs = []
+            latest_meta_info = {}
+            latest_text = ""
+            current_chunk_output_ids = []
+            all_data_lines = []
+            buffer = b""
+            headers = {"Content-Type": "application/json; charset=utf-8"}
+
+            async with client.stream("POST", url, json=payload or {}, headers=headers) as response:
+                response.raise_for_status()
+
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        try:
+                            data_str = line.decode().strip()
+                        except UnicodeDecodeError:
+                            continue
+
+                        if not data_str:
+                            continue
+                        if data_str.startswith("data:"):
+                            data_str = data_str[5:].strip()
+                        if not data_str:
+                            continue
+                        if data_str == "[DONE]":
+                            final_meta_info = dict(latest_meta_info)
+                            final_meta_info["completion_tokens"] = len(aggregated_output_ids)
+                            if aggregated_output_token_logprobs:
+                                final_meta_info["output_token_logprobs"] = aggregated_output_token_logprobs
+                            return {
+                                "text": latest_text,
+                                "output_ids": aggregated_output_ids,
+                                "meta_info": final_meta_info,
+                            }
+
+                        all_data_lines.append(data_str)
+                        data = json.loads(data_str)
+                        if "error" in data:
+                            return data
+
+                        latest_text = data.get("text", latest_text)
+                        meta_info = data.get("meta_info", {}) or {}
+                        latest_meta_info = meta_info
+                        chunk_output_ids = _extract_chunk_output_ids(data, meta_info)
+                        if not chunk_output_ids:
+                            continue
+
+                        if (
+                            len(chunk_output_ids) >= len(current_chunk_output_ids)
+                            and chunk_output_ids[: len(current_chunk_output_ids)] == current_chunk_output_ids
+                        ):
+                            new_output_ids = chunk_output_ids[len(current_chunk_output_ids) :]
+                            start_idx = len(current_chunk_output_ids)
+                            end_idx = len(chunk_output_ids)
+                            current_chunk_output_ids = chunk_output_ids
+                        else:
+                            new_output_ids = chunk_output_ids
+                            start_idx = 0
+                            end_idx = len(chunk_output_ids)
+                            current_chunk_output_ids.extend(chunk_output_ids)
+
+                        if new_output_ids:
+                            aggregated_output_ids.extend(new_output_ids)
+                            output_token_logprobs = meta_info.get("output_token_logprobs") or []
+                            if output_token_logprobs:
+                                if len(output_token_logprobs) >= end_idx:
+                                    aggregated_output_token_logprobs.extend(output_token_logprobs[start_idx:end_idx])
+                                else:
+                                    aggregated_output_token_logprobs.extend(
+                                        output_token_logprobs[-len(new_output_ids) :]
+                                    )
+
+                if buffer:
+                    try:
+                        data_str = buffer.decode().strip()
+                    except UnicodeDecodeError:
+                        data_str = ""
+                    if data_str.startswith("data:"):
+                        data_str = data_str[5:].strip()
+                    if data_str and data_str != "[DONE]":
+                        all_data_lines.append(data_str)
+
+                if all_data_lines:
+                    for data_str in reversed(all_data_lines):
+                        try:
+                            return json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                content = await response.aread()
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    return content.decode() if isinstance(content, bytes) else content
+        except Exception as e:
+            retry_count += 1
+
+            if isinstance(e, httpx.HTTPStatusError):
+                response_text = e.response.text
+            else:
+                response_text = None
+
+            logger.info(
+                f"Stream error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
+            )
+            if retry_count >= max_retries:
+                logger.info(f"Max retries ({max_retries}) reached for stream request, failing... (url={url})")
+                raise e
+            await asyncio.sleep(1)
+            continue
+        finally:
+            if response is not None:
+                await response.aclose()
+        break
+
+    raise RuntimeError(f"Stream request finished unexpectedly without [DONE] (url={url})")
 
 
 def init_http_client(args):
@@ -286,6 +433,10 @@ async def post(url, payload, max_retries=60):
             # fall through to local
 
     return await _post(_http_client, url, payload, max_retries)
+
+
+async def post_stream(url, payload, max_retries=60):
+    return await _post_stream(_http_client, url, payload, max_retries)
 
 
 async def get(url):

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import os
 import re
+import socket
+import uuid
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any
 
 try:
@@ -22,6 +27,7 @@ logger = logging.getLogger(__name__)
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 # Accept either name; verl uses `calc_geo3k_reward` while the instruction refers to `calc_score`.
 SUPPORTED_TOOL_NAMES = {"calc_score", "calc_geo3k_reward"}
+FAULT_TYPES = ("oom", "segmentation_fault", "bus_error", "illegal_instruction", "rpc_timeout")
 
 
 class Geo3kEnv(BaseInteractionEnv):
@@ -34,12 +40,24 @@ class Geo3kEnv(BaseInteractionEnv):
     step; responses are provided but no further turns are taken.
     """
 
-    def __init__(self, *, ground_truth: str | None = None, max_turns: int | None = None):
+    def __init__(
+        self,
+        *,
+        ground_truth: str | None = None,
+        max_turns: int | None = None,
+        fault_injection_enabled: bool = True,
+        fault_injection_prob: float = 0.1,
+    ):
         self.ground_truth = str(ground_truth) if ground_truth is not None else None
         self.tool_calls: list[dict[str, Any]] = []
         self.last_tool_score: float | None = None
         self.turn = 0
         self.max_turns = max_turns
+        self.fault_injection_enabled = fault_injection_enabled
+        self.fault_injection_prob = max(0.0, min(1.0, float(fault_injection_prob)))
+        self.total_step_calls = 0
+        logger.info("create Geo3kEnv with ground_truth=%s, max_turns=%s, fault_injection_enabled=%s, fault_injection_prob=%.3f",
+                self.ground_truth, self.max_turns, self.fault_injection_enabled, self.fault_injection_prob)
 
     def reset(self):
         self.tool_calls.clear()
@@ -178,10 +196,168 @@ class Geo3kEnv(BaseInteractionEnv):
                 "Your answer is wrong. You may need to reason in a different way. Don't repeat your answer unless necessary."
             )
 
+    def _preview_text(self, text: str, limit: int = 120) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
+    def _utc_timestamp(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    def _random_hex_address(self) -> str:
+        return f"0x{random.getrandbits(48):012x}"
+
+    def _build_fault_message(self, tool_name: str, parsed_answer: str, response_text: str) -> tuple[str, dict[str, Any]]:
+        fault_type = random.choice(FAULT_TYPES)
+        request_id = f"geo3k-{uuid.uuid4().hex[:12]}"
+        worker_id = f"rm-worker-{random.randint(0, 7)}"
+        hostname = socket.gethostname()
+        pid = random.randint(12000, 65000)
+        answer_preview = self._preview_text(parsed_answer or "<empty>", limit=96)
+        response_preview = self._preview_text(response_text, limit=160)
+        timestamp = self._utc_timestamp()
+        turn_idx = self.turn
+        step_idx = self.total_step_calls
+
+        lines = [
+            f"[{timestamp}] INFO geo3k.reward_client request_id={request_id} step={step_idx} turn={turn_idx} tool={tool_name}",
+            f"[{timestamp}] INFO geo3k.reward_client answer_preview={answer_preview!r}",
+            f"[{timestamp}] DEBUG geo3k.reward_client response_preview={response_preview!r}",
+            f"[{timestamp}] INFO geo3k.reward_client dispatch target={worker_id}@{hostname} pid={pid}",
+        ]
+
+        if fault_type == "oom":
+            lines.extend(
+                [
+                    f"[{timestamp}] ERROR geo3k.reward_worker request_id={request_id} status=RESOURCE_EXHAUSTED detail='scoring worker ran out of memory while normalizing candidate expression tree'",
+                    "Traceback (most recent call last):",
+                    '  File "/opt/geo3k/reward_server/worker.py", line 218, in handle_calc_score',
+                    "    normalized = normalize_expression(parsed_answer)",
+                    '  File "/opt/geo3k/reward_server/symbolic.py", line 147, in normalize_expression',
+                    "    cache = np.empty((268435456,), dtype=np.float64)",
+                    "numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.00 GiB for an array with shape (268435456,) and data type float64",
+                    "",
+                    "During handling of the above exception, another exception occurred:",
+                    "",
+                    "Traceback (most recent call last):",
+                    '  File "/opt/geo3k/reward_server/main.py", line 94, in dispatch_request',
+                    "    return worker.handle_calc_score(payload)",
+                    '  File "/opt/geo3k/reward_server/worker.py", line 226, in handle_calc_score',
+                    "    raise RuntimeError('calc_score backend OOM')",
+                    "RuntimeError: calc_score backend OOM",
+                    f"[  +0.000021] Memory cgroup out of memory: Killed process {pid} (python3) total-vm:{random.randint(2200000, 3200000)}kB, anon-rss:{random.randint(800000, 1500000)}kB, file-rss:512kB, shmem-rss:0kB, UID:0 pgtables:4096kB oom_score_adj:0",
+                ]
+            )
+            return "\n".join(lines), {
+                "fault_type": fault_type,
+                "request_id": request_id,
+                "worker_id": worker_id,
+                "pid": pid,
+            }
+
+        if fault_type == "segmentation_fault":
+            lines.extend(
+                [
+                    f"[{timestamp}] ERROR geo3k.reward_worker request_id={request_id} status=INTERNAL detail='worker crashed during symbolic equivalence check'",
+                    "Fatal Python error: Segmentation fault",
+                    "",
+                    "Current thread 0x00007f8d6c7fe740 (most recent call first):",
+                    '  File "/opt/geo3k/reward_server/symbolic.py", line 312, in compare_symbolic_forms',
+                    '  File "/opt/geo3k/reward_server/worker.py", line 241, in handle_calc_score',
+                    '  File "/opt/geo3k/reward_server/main.py", line 94, in dispatch_request',
+                    "",
+                    "Native stack trace:",
+                    f"  /lib/x86_64-linux-gnu/libc.so.6(+0x{random.randint(0x10000, 0x8FFFF):x}) [{self._random_hex_address()}]",
+                    f"  /usr/bin/python3(PyEval_EvalFrameDefault+0x{random.randint(0x100, 0x7000):x}) [{self._random_hex_address()}]",
+                    f"  /usr/bin/python3(PyObject_Call+0x{random.randint(0x40, 0x500):x}) [{self._random_hex_address()}]",
+                    f"python3: line 1: {pid} Segmentation fault (core dumped) /usr/bin/python3 /opt/geo3k/reward_server/main.py --worker-id {worker_id}",
+                ]
+            )
+            return "\n".join(lines), {
+                "fault_type": fault_type,
+                "request_id": request_id,
+                "worker_id": worker_id,
+                "pid": pid,
+            }
+
+        if fault_type == "bus_error":
+            lines.extend(
+                [
+                    f"[{timestamp}] ERROR geo3k.reward_worker request_id={request_id} status=INTERNAL detail='shared-memory page fault while deserializing scoring request'",
+                    "Fatal Python error: Bus error",
+                    "",
+                    "Current thread 0x00007f1bb43fe740 (most recent call first):",
+                    '  File "/opt/geo3k/reward_server/ipc.py", line 88, in load_request',
+                    '  File "/opt/geo3k/reward_server/worker.py", line 203, in handle_calc_score',
+                    "",
+                    "Native stack trace:",
+                    f"  /lib/x86_64-linux-gnu/libc.so.6(+0x{random.randint(0x10000, 0x8FFFF):x}) [{self._random_hex_address()}]",
+                    f"  /usr/bin/python3(Py_BytesMain+0x{random.randint(0x40, 0x500):x}) [{self._random_hex_address()}]",
+                    f"[  +0.000018] traps: python3[{pid}] general protection fault ip:{self._random_hex_address()} sp:{self._random_hex_address()} error:0 in libpython3.10.so.1.0[{self._random_hex_address()}+0x{random.randint(0x1000, 0x9000):x}]",
+                    f"python3: line 1: {pid} Bus error               (core dumped) /usr/bin/python3 /opt/geo3k/reward_server/main.py --worker-id {worker_id}",
+                ]
+            )
+            return "\n".join(lines), {
+                "fault_type": fault_type,
+                "request_id": request_id,
+                "worker_id": worker_id,
+                "pid": pid,
+            }
+
+        if fault_type == "illegal_instruction":
+            lines.extend(
+                [
+                    f"[{timestamp}] ERROR geo3k.reward_worker request_id={request_id} status=INTERNAL detail='unexpected CPU feature mismatch while evaluating numeric fallback'",
+                    "Fatal Python error: Illegal instruction",
+                    "",
+                    "Current thread 0x00007f4af2dfe740 (most recent call first):",
+                    '  File "/opt/geo3k/reward_server/numeric.py", line 154, in numeric_equivalence',
+                    '  File "/opt/geo3k/reward_server/worker.py", line 248, in handle_calc_score',
+                    "",
+                    "Native stack trace:",
+                    f"  /lib/x86_64-linux-gnu/libc.so.6(+0x{random.randint(0x10000, 0x8FFFF):x}) [{self._random_hex_address()}]",
+                    f"  /usr/bin/python3(_PyEval_EvalFrameDefault+0x{random.randint(0x100, 0x7000):x}) [{self._random_hex_address()}]",
+                    f"[  +0.000012] traps: python3[{pid}] invalid opcode ip:{self._random_hex_address()} sp:{self._random_hex_address()} error:0 in libpython3.10.so.1.0[{self._random_hex_address()}+0x{random.randint(0x1000, 0x9000):x}]",
+                    f"python3: line 1: {pid} Illegal instruction     (core dumped) /usr/bin/python3 /opt/geo3k/reward_server/main.py --worker-id {worker_id}",
+                ]
+            )
+            return "\n".join(lines), {
+                "fault_type": fault_type,
+                "request_id": request_id,
+                "worker_id": worker_id,
+                "pid": pid,
+            }
+
+        lines.extend(
+            [
+                f"[{timestamp}] WARNING geo3k.reward_client request_id={request_id} rpc_deadline_ms=2500",
+                f"[{timestamp}] ERROR geo3k.reward_client request_id={request_id} status=DEADLINE_EXCEEDED detail='calc_score backend timed out waiting for worker response'",
+                "Traceback (most recent call last):",
+                '  File "/opt/geo3k/reward_client/client.py", line 131, in call_calc_score',
+                "    response = stub.CalcScore(request, timeout=2.5)",
+                '  File "/usr/local/lib/python3.10/site-packages/grpc/_channel.py", line 1166, in __call__',
+                "    return _end_unary_response_blocking(state, call, False, None)",
+                "grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:",
+                "    status = StatusCode.DEADLINE_EXCEEDED",
+                "    details = \"calc_score backend timed out waiting for worker response\"",
+                f"    debug_error_string = \"UNKNOWN:Error received from peer ipv4:127.0.0.1:{random.randint(20000, 40000)} {{grpc_status:4, grpc_message:\\\"calc_score backend timed out waiting for worker response\\\"}}\"",
+                ">",
+            ]
+        )
+        return "\n".join(lines), {
+            "fault_type": fault_type,
+            "request_id": request_id,
+            "worker_id": worker_id,
+            "pid": pid,
+        }
+
     # Called during rollout after receiving a model response
     def step(self, response_text: str):
         self.turn += 1
+        self.total_step_calls += 1
         is_final_turn = self.max_turns is not None and self.turn >= self.max_turns
+
         tool_call = self._extract_tool_call(response_text)
         info: dict[str, Any] = {"tool_call": deepcopy(tool_call)}
 
@@ -234,6 +410,26 @@ class Geo3kEnv(BaseInteractionEnv):
             "role": "tool",
             "tool_score": score,
         }
+        if score == 1 and self.fault_injection_enabled and random.random() < 0.5: # all fault
+            injected_error, fault_meta = self._build_fault_message(name, parsed_answer, response_text)
+            obs = {
+                "obs_str": injected_error,
+                "role": "tool",
+            }
+            info.update(
+                {
+                    "tool_executed": False,
+                    **fault_meta,
+                }
+            )
+            logger.info(
+                "Injecting fault into step %d request_id=%s type=%s tool=%s",
+                self.total_step_calls,
+                fault_meta["request_id"],
+                fault_meta["fault_type"],
+                name,
+            )
+            return obs, is_final_turn, info
 
         return obs, is_final_turn, info
 
@@ -260,7 +456,12 @@ def _extract_ground_truth(sample: Sample | None) -> str | None:
     return None
 
 
-def build_env(sample: Sample | None = None, args: Any | None = None, **_: Any) -> Geo3kEnv:
+def build_env(
+    sample: Sample | None = None,
+    args: Any | None = None,
+    evaluation: bool = False,
+    **_: Any,
+) -> Geo3kEnv:
     """
     Construct a Geo3kEnv. Ground truth is pulled from sample.label or metadata.
     """
@@ -270,4 +471,20 @@ def build_env(sample: Sample | None = None, args: Any | None = None, **_: Any) -
         raise ValueError("max_turns must be set via --custom-config-path in the custom config file.")
     if ground_truth is None:
         logger.warning("Ground truth answer missing; calc_score tool will always return 0.")
-    return Geo3kEnv(ground_truth=ground_truth, max_turns=max_turns)
+    fault_injection_enabled = os.environ.get("ENV_FAULT_INJECTION_ENABLED", str(True)).lower() in ("1", "true", "yes")
+    fault_injection_prob = float(os.environ.get("ENV_FAULT_INJECTION_PROB", "0.1"))
+    if args is not None:
+        if getattr(args, "fault_injection_enabled", None) is not None:
+            fault_injection_enabled = bool(args.fault_injection_enabled)
+        if getattr(args, "fault_injection_prob", None) is not None:
+            fault_injection_prob = float(args.fault_injection_prob)
+    # Keep training controlled by env vars/args, but never inject faults during eval rollout.
+    if evaluation:
+        fault_injection_enabled = False
+
+    return Geo3kEnv(
+        ground_truth=ground_truth,
+        max_turns=max_turns,
+        fault_injection_enabled=fault_injection_enabled,
+        fault_injection_prob=fault_injection_prob,
+    )

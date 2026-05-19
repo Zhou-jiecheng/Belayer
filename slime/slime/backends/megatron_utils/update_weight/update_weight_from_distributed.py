@@ -1,3 +1,4 @@
+import logging
 import socket
 import time
 from argparse import Namespace
@@ -15,6 +16,8 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromDistributed:
@@ -41,6 +44,104 @@ class UpdateWeightFromDistributed:
         self.quantization_config = quantization_config
         self.weight_version = 0
         self._model_update_groups = None
+
+    def _should_verify_rollout_weight_update(self) -> bool:
+        return bool(getattr(self.args, "verify_rollout_weight_update", False))
+
+    def _is_supported_verify_param_name(self, name: str) -> bool:
+        return name.endswith(".self_attn.o_proj.weight") or name.endswith(".mlp.down_proj.weight")
+
+    def _record_verify_samples(
+        self,
+        verify_samples: list[tuple[str, torch.Tensor]],
+        seen_names: set[str],
+        named_tensors: Sequence[tuple[str, torch.Tensor]],
+    ) -> None:
+        if not self._should_verify_rollout_weight_update():
+            return
+
+        target_num_params = max(0, int(getattr(self.args, "verify_rollout_weight_update_num_params", 0)))
+        target_num_values = max(1, int(getattr(self.args, "verify_rollout_weight_update_num_values", 16)))
+        if len(verify_samples) >= target_num_params:
+            return
+
+        def maybe_append(name: str, param: torch.Tensor) -> bool:
+            if (
+                name in seen_names
+                or not torch.is_floating_point(param)
+                or not self._is_supported_verify_param_name(name)
+            ):
+                return False
+            verify_samples.append((name, param.detach().float().flatten()[:target_num_values].cpu().clone()))
+            seen_names.add(name)
+            return True
+
+        for name, param in named_tensors:
+            if len(verify_samples) >= target_num_params:
+                return
+            maybe_append(name, param)
+
+    def _verify_rollout_engine_weights(self, verify_samples: Sequence[tuple[str, torch.Tensor]]) -> None:
+        if not self._should_verify_rollout_weight_update() or dist.get_rank() != 0:
+            return
+        if not getattr(self, "rollout_engines", None):
+            logger.warning(
+                "verify_rollout_weight_update is enabled, but no rollout engines are attached to the updater."
+            )
+            return
+
+        target_version = str(self.weight_version)
+        truncate_size = max(1, int(getattr(self.args, "verify_rollout_weight_update_truncate_size", 4)))
+        compare_num_values = max(1, int(getattr(self.args, "verify_rollout_weight_update_num_values", 16)))
+
+        for engine_index, engine in enumerate(self.rollout_engines):
+            engine_version = ray.get(engine.get_weight_version.remote())
+            if str(engine_version) != target_version:
+                raise RuntimeError(
+                    f"Rollout engine[{engine_index}] weight version mismatch: "
+                    f"engine={engine_version}, expected={target_version}"
+                )
+
+            sample_summaries: list[str] = []
+            for name, expected_prefix in verify_samples:
+                actual = ray.get(engine.get_weights_by_name.remote(name=name, truncate_size=truncate_size))
+                if actual is None:
+                    raise RuntimeError(
+                        f"Rollout engine[{engine_index}] returned no data for sampled weight '{name}' "
+                        f"while verifying weight_version={target_version}"
+                    )
+
+                actual_prefix = torch.tensor(actual, dtype=torch.float32).flatten()[:compare_num_values].cpu()
+                expected_prefix = expected_prefix[:compare_num_values].cpu()
+                compare_len = min(actual_prefix.numel(), expected_prefix.numel())
+                if compare_len == 0:
+                    raise RuntimeError(
+                        f"Rollout engine[{engine_index}] returned an empty tensor prefix for sampled weight '{name}' "
+                        f"while verifying weight_version={target_version}"
+                    )
+
+                actual_prefix = actual_prefix[:compare_len]
+                expected_prefix = expected_prefix[:compare_len]
+                max_abs_diff = torch.max(torch.abs(actual_prefix - expected_prefix)).item()
+                mean_abs_diff = torch.mean(torch.abs(actual_prefix - expected_prefix)).item()
+                if not torch.allclose(actual_prefix, expected_prefix, atol=5e-3, rtol=1e-3):
+                    raise RuntimeError(
+                        f"Rollout engine[{engine_index}] sampled weight mismatch for '{name}' at "
+                        f"weight_version={target_version}: compare_len={compare_len}, "
+                        f"max_abs_diff={max_abs_diff:.6g}, mean_abs_diff={mean_abs_diff:.6g}, "
+                        f"expected={expected_prefix.tolist()}, actual={actual_prefix.tolist()}"
+                    )
+
+                sample_summaries.append(
+                    f"{name}(n={compare_len}, max_abs_diff={max_abs_diff:.3g}, mean_abs_diff={mean_abs_diff:.3g})"
+                )
+
+            logger.info(
+                "Verified rollout engine[%s] weight update: weight_version=%s samples=%s",
+                engine_index,
+                target_version,
+                sample_summaries,
+            )
 
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
@@ -76,6 +177,8 @@ class UpdateWeightFromDistributed:
         Pause → flush → non-expert (TP) → expert (EP) → continue. Progress on PP source.
         """
         self.weight_version += 1
+        verify_samples: list[tuple[str, torch.Tensor]] = []
+        verify_sample_names: set[str] = set()
 
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
@@ -99,7 +202,13 @@ class UpdateWeightFromDistributed:
             if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
-                name, param, converted_named_tensors, buffer_size, pbar=pbar
+                name,
+                param,
+                converted_named_tensors,
+                buffer_size,
+                verify_samples,
+                verify_sample_names,
+                pbar=pbar,
             )
 
         if converted_named_tensors:
@@ -128,6 +237,7 @@ class UpdateWeightFromDistributed:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
+            self._verify_rollout_engine_weights(verify_samples)
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
@@ -137,6 +247,8 @@ class UpdateWeightFromDistributed:
         param: torch.nn.Parameter,
         converted_named_tensors: list[tuple[str, torch.Tensor]],
         buffer_size: int,
+        verify_samples: list[tuple[str, torch.Tensor]],
+        verify_sample_names: set[str],
         pbar: tqdm | None = None,
     ) -> int | None:
         """
@@ -151,7 +263,9 @@ class UpdateWeightFromDistributed:
         if buffer_size + param_size > self.args.update_weight_buffer_size:
             self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
             buffer_size = 0
-        converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+        converted = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+        self._record_verify_samples(verify_samples, verify_sample_names, converted)
+        converted_named_tensors += converted
         buffer_size += param_size
         return buffer_size
 

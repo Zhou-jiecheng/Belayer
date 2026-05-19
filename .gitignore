@@ -20,6 +20,12 @@ instructions/
 checkpoint-engine/.git.disabled/
 sglang/.git.disabled/
 fault-inject-slime/.git.disabled/
+slime/checkpoints/
+slime/debug_data/
+slime/tensorboard_022/
+swe-rl/output/
+swe-rl/resource_stats/
+swe-rl/resource_stats_v2/
 *.pyc
 logs
 .DS_Store

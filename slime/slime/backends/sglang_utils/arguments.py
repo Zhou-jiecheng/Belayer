@@ -35,6 +35,42 @@ def add_sglang_arguments(parser):
     parser = add_sglang_router_arguments(parser)
     parser.set_defaults(router_balance_abs_threshold=10, router_balance_rel_threshold=1.2)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument(
+        "--sglang-enable-fast-restart",
+        action="store_true",
+        default=False,
+        help="Enable shadow-worker-based fast restart for local rollout engines when shared weight/KV-cache resources are configured.",
+    )
+    parser.add_argument(
+        "--sglang-shadow-worker-kv-cache-socket-path",
+        type=str,
+        default=None,
+        help="Optional comma-separated KV cache socket paths exported to SGLANG_KV_CACHE_SOCKET_PATH for fast restart.",
+    )
+    parser.add_argument(
+        "--sglang-shadow-worker-weight-server-base-port",
+        type=int,
+        default=None,
+        help="Base checkpoint-engine port used to derive per-engine weight_load_port for fast restart.",
+    )
+    parser.add_argument(
+        "--sglang-shadow-worker-min-gpu-id",
+        type=int,
+        default=None,
+        help="Minimum physical GPU id that maps to the base shadow-worker weight server port.",
+    )
+    parser.add_argument(
+        "--sglang-shadow-worker-ready-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Maximum time to wait for each shadow worker to become handover-ready before rollout starts.",
+    )
+    parser.add_argument(
+        "--sglang-shadow-worker-stabilization-seconds",
+        type=float,
+        default=0.0,
+        help="Extra time to wait after a shadow worker reports ready, to let warmup such as CUDA graph capture settle.",
+    )
 
     old_add_argument = parser.add_argument
 

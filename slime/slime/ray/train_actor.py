@@ -7,6 +7,7 @@ from datetime import timedelta
 import ray
 import torch
 import torch.distributed as dist
+from ray.exceptions import GetTimeoutError
 
 import slime.utils.eval_config
 from slime.ray.ray_actor import RayActor
@@ -128,7 +129,11 @@ class TrainRayActor(RayActor):
     def _get_parallel_config(self):
         raise NotImplementedError
 
+    def get_train_parallel_config(self):
+        logger.info("[TrainRayActor.get_train_parallel_config] rank=%s config=%s", self.args.rank, self.train_parallel_config)
+        return self.train_parallel_config
+
     def set_rollout_manager(self, rollout_manager):
         self.rollout_manager = rollout_manager
-        if self.args.rank == 0:
-            ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))
+        logger.info("[TrainRayActor.set_rollout_manager] enter rank=%s", self.args.rank)
+        logger.info("[TrainRayActor.set_rollout_manager] exit rank=%s", self.args.rank)

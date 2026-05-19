@@ -2,6 +2,8 @@ import logging
 import os
 import random
 import socket
+import time
+import json
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -40,6 +42,96 @@ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_for_log(value, limit: int = 4000) -> str:
+    try:
+        if isinstance(value, str):
+            rendered = value
+        else:
+            rendered = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        rendered = repr(value)
+    if len(rendered) > limit:
+        return f"{rendered[:limit]}...<truncated {len(rendered) - limit} chars>"
+    return rendered
+
+
+def _should_log_rollout_validation() -> bool:
+    tp_rank_fn = getattr(mpu, "get_tensor_model_parallel_rank", None)
+    if callable(tp_rank_fn) and tp_rank_fn() != 0:
+        return False
+
+    cp_rank_fn = getattr(mpu, "get_context_parallel_rank", None)
+    if callable(cp_rank_fn) and cp_rank_fn() != 0:
+        return False
+
+    is_pp_first_fn = getattr(mpu, "is_pipeline_first_stage", None)
+    if callable(is_pp_first_fn):
+        return bool(is_pp_first_fn())
+
+    return True
+
+
+def _log_zero_prompt_length_samples(rollout_id: int, rollout_data: RolloutBatch) -> None:
+    if not _should_log_rollout_validation():
+        return
+
+    total_lengths = rollout_data.get("total_lengths", [])
+    response_lengths = rollout_data.get("response_lengths", [])
+    prompts = rollout_data.get("prompt", [None] * len(total_lengths))
+    sample_indices = rollout_data.get("sample_indices", [None] * len(total_lengths))
+    metadata_list = rollout_data.get("metadata", [None] * len(total_lengths))
+    tokens_list = rollout_data.get("tokens", [None] * len(total_lengths))
+    loss_masks = rollout_data.get("loss_masks", [None] * len(total_lengths))
+
+    bad_indices = [
+        idx
+        for idx, (total_length, response_length) in enumerate(
+            zip(total_lengths, response_lengths, strict=True)
+        )
+        if total_length - response_length <= 0
+    ]
+    if not bad_indices:
+        return
+
+    logger.warning(
+        "Detected %d samples with prompt_length<=0 before Megatron for rollout_id=%s: local_indices=%s",
+        len(bad_indices),
+        rollout_id,
+        bad_indices,
+    )
+
+    for idx in bad_indices:
+        total_length = total_lengths[idx]
+        response_length = response_lengths[idx]
+        prompt_length = total_length - response_length
+        prompt = prompts[idx] if idx < len(prompts) else None
+        sample_index = sample_indices[idx] if idx < len(sample_indices) else None
+        metadata = metadata_list[idx] if idx < len(metadata_list) else None
+        token_tensor = tokens_list[idx] if idx < len(tokens_list) else None
+        loss_mask = loss_masks[idx] if idx < len(loss_masks) else None
+
+        token_ids = token_tensor.tolist() if isinstance(token_tensor, torch.Tensor) else token_tensor
+        loss_mask_list = loss_mask.tolist() if isinstance(loss_mask, torch.Tensor) else loss_mask
+
+        logger.warning(
+            "prompt_length<=0 sample: rollout_id=%s local_idx=%d sample_index=%s "
+            "total_length=%s response_length=%s prompt_length=%s "
+            "token_count=%s loss_mask_len=%s prompt=%s metadata=%s token_ids=%s loss_mask=%s",
+            rollout_id,
+            idx,
+            sample_index,
+            total_length,
+            response_length,
+            prompt_length,
+            len(token_ids) if token_ids is not None else None,
+            len(loss_mask_list) if loss_mask_list is not None else None,
+            _truncate_for_log(prompt),
+            _truncate_for_log(metadata),
+            _truncate_for_log(token_ids, limit=2000),
+            _truncate_for_log(loss_mask_list, limit=2000),
+        )
 
 
 def _offload_rollout_data_to_cpu(rollout_data: RolloutBatch) -> None:
@@ -405,6 +497,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
+            _log_zero_prompt_length_samples(rollout_id, rollout_data)
             if self.args.debug_rollout_only:
                 log_rollout_data(rollout_id, self.args, rollout_data)
                 return
@@ -588,15 +681,35 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote(include_prm=False)
         )
+        reconnect_debug_state = ray.get(self.rollout_manager.get_weight_update_reconnect_debug_state.remote())
+        pending_shadow_reconnects = reconnect_debug_state["pending_shadow_handover_reconnects"]
+        if pending_shadow_reconnects > 0 and num_new_engines <= 0:
+            raise RuntimeError(
+                "Shadow handover requires a weight-update reconnect, but update_weights observed no pending rollout "
+                f"engine reconnects. debug_state={reconnect_debug_state}"
+            )
 
         if self.args.offload_train:
             reload_process_groups()
 
         if num_new_engines > 0:
+            reconnect_start_time = time.perf_counter()
+            if dist.get_rank() == 0:
+                logger.info(
+                    "Rebuilding weight-update connections for %s rollout engine(s) before Megatron update_weights",
+                    num_new_engines,
+                )
             self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
+                ray.get(self.rollout_manager.clear_num_new_engines.remote(consumed=num_new_engines))
+                if pending_shadow_reconnects > 0:
+                    ray.get(self.rollout_manager.ack_shadow_handover_weight_update_reconnect.remote())
+                logger.info(
+                    "Weight-update reconnect finished in %.3fs for %s rollout engine(s) before Megatron update_weights",
+                    time.perf_counter() - reconnect_start_time,
+                    num_new_engines,
+                )
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")

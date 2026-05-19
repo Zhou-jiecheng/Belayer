@@ -1,5 +1,6 @@
 import logging
 import socket
+import time
 
 import ray
 from ray.util.placement_group import placement_group
@@ -140,38 +141,112 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg):
 
 
 def create_training_models(args, pgs, rollout_manager):
+    total_start = time.perf_counter()
+    logger.info("[create_training_models] start")
+
+    step_start = time.perf_counter()
+    logger.info("[create_training_models] allocating actor train group...")
     actor_model = allocate_train_group(
         args=args,
         num_nodes=args.actor_num_nodes,
         num_gpus_per_node=args.actor_num_gpus_per_node,
         pg=pgs["actor"],
     )
+    logger.info(
+        "[create_training_models] actor train group allocated in %.2fs",
+        time.perf_counter() - step_start,
+    )
+
     if args.use_critic:
+        step_start = time.perf_counter()
+        logger.info("[create_training_models] allocating critic train group...")
         critic_model = allocate_train_group(
             args=args,
             num_nodes=args.critic_num_nodes,
             num_gpus_per_node=args.critic_num_gpus_per_node,
             pg=pgs["critic"],
         )
+        logger.info(
+            "[create_training_models] critic train group allocated in %.2fs",
+            time.perf_counter() - step_start,
+        )
+
+        logger.info("[create_training_models] submitting critic async_init...")
         critic_init_handle = critic_model.async_init(args, role="critic", with_ref=False)
     else:
         critic_model = None
 
-    start_rollout_ids = ray.get(
-        actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
+    actor_with_ref = args.kl_coef != 0 or args.use_kl_loss
+    logger.info(
+        "[create_training_models] submitting actor async_init (with_ref=%s)...",
+        actor_with_ref,
+    )
+    actor_init_handle = actor_model.async_init(args, role="actor", with_ref=actor_with_ref)
+
+    step_start = time.perf_counter()
+    logger.info("[create_training_models] waiting actor async_init via ray.get...")
+    start_rollout_ids = ray.get(actor_init_handle)
+    logger.info(
+        "[create_training_models] actor async_init finished in %.2fs, start_rollout_ids=%s",
+        time.perf_counter() - step_start,
+        start_rollout_ids,
     )
 
     assert len(set(start_rollout_ids)) == 1
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
+        logger.info("[create_training_models] args.start_rollout_id is set to %s", args.start_rollout_id)
 
     if args.use_critic:
+        step_start = time.perf_counter()
+        logger.info("[create_training_models] waiting critic async_init via ray.get...")
         ray.get(critic_init_handle)
-        actor_model.connect(critic_model)
+        logger.info(
+            "[create_training_models] critic async_init finished in %.2fs",
+            time.perf_counter() - step_start,
+        )
 
+        logger.info("[create_training_models] connecting actor and critic...")
+        actor_model.connect(critic_model)
+        logger.info("[create_training_models] actor/critic connection done")
+
+    logger.info("[create_training_models] setting rollout manager on actor...")
     actor_model.set_rollout_manager(rollout_manager)
+    logger.info("[create_training_models] rollout manager set")
+
+    step_start = time.perf_counter()
+    logger.info("[create_training_models] fetching actor train_parallel_config from rank 0...")
+    train_parallel_config = actor_model.get_train_parallel_config()
+    logger.info(
+        "[create_training_models] actor train_parallel_config fetched in %.2fs: %s",
+        time.perf_counter() - step_start,
+        train_parallel_config,
+    )
+
+    step_start = time.perf_counter()
+    logger.info("[create_training_models] setting rollout manager train_parallel_config from driver...")
+    ray.get(rollout_manager.set_train_parallel_config.remote(train_parallel_config))
+    logger.info(
+        "[create_training_models] rollout manager train_parallel_config set in %.2fs",
+        time.perf_counter() - step_start,
+    )
+
     if args.rollout_global_dataset:
+        step_start = time.perf_counter()
+        logger.info(
+            "[create_training_models] loading rollout global dataset from rollout_id=%s...",
+            args.start_rollout_id - 1,
+        )
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+        logger.info(
+            "[create_training_models] rollout global dataset loaded in %.2fs",
+            time.perf_counter() - step_start,
+        )
+
+    logger.info(
+        "[create_training_models] done in %.2fs",
+        time.perf_counter() - total_start,
+    )
 
     return actor_model, critic_model
 
@@ -181,6 +256,14 @@ def create_rollout_manager(args, pg, prm_pg=None):
         num_cpus=1,
         num_gpus=0,
     ).remote(args, pg, prm_pg)
+
+    logger.info("[create_rollout_manager] waiting rollout manager ready...")
+    ready_start = time.perf_counter()
+    ray.get(rollout_manager.ready.remote())
+    logger.info(
+        "[create_rollout_manager] rollout manager ready in %.2fs",
+        time.perf_counter() - ready_start,
+    )
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None

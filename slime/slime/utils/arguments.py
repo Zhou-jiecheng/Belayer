@@ -518,7 +518,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rollout-health-check-timeout",
                 type=float,
-                default=30.0,
+                default=60.0,
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
             )
             parser.add_argument(
@@ -1469,6 +1469,35 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--ci-test",
                 action="store_true",
+            )
+            parser.add_argument(
+                "--verify-rollout-weight-update",
+                action="store_true",
+                help=(
+                    "After each actor->rollout weight push, verify rollout-engine weight_version "
+                    "and sample a few parameter values from the live rollout engines."
+                ),
+            )
+            parser.add_argument(
+                "--verify-rollout-weight-update-num-params",
+                type=int,
+                default=3,
+                help="How many rollout-engine parameters to sample per weight update verification.",
+            )
+            parser.add_argument(
+                "--verify-rollout-weight-update-num-values",
+                type=int,
+                default=16,
+                help="How many leading flattened values to compare for each sampled parameter.",
+            )
+            parser.add_argument(
+                "--verify-rollout-weight-update-truncate-size",
+                type=int,
+                default=4,
+                help=(
+                    "Truncate size used when querying rollout-engine parameters by name. "
+                    "Smaller values reduce debug overhead."
+                ),
             )
             parser.add_argument(
                 "--ci-disable-kl-checker",

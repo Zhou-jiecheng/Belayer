@@ -8,7 +8,8 @@ def get_docker_image_name(instance: dict, data_source: str) -> str:
         iid = instance["instance_id"]
         if "swe-gym" in data_source.lower():
             id_docker_compatible = iid.replace("__", "_s_")
-            image_name = f"docker.io/xingyaoww/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
+            # image_name = f"docker.io/xingyaoww/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
+            image_name = f"registry.h.pjlab.org.cn/ailab-sys-sys_gpu/swe-rl:{id_docker_compatible}".lower()
         elif "swe-bench" in data_source.lower():
             id_docker_compatible = iid.replace("__", "_1776_")
             image_name = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()

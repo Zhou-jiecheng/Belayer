@@ -1,0 +1,6 @@
+# rm -rf ./examples/prime_code_multi_turn/  && cp -r /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/slime/examples/prime_code_multi_turn/ ./examples/prime_code_multi_turn/
+# rm -rf ./examples/geo3k_vlm_multi_turn/  && cp -r /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/slime/examples/geo3k_vlm_multi_turn/ ./examples/geo3k_vlm_multi_turn/
+TENSORBOARD_DIR=/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/slime/tensorboard_022/prime_code_multi_turn/Qwen2.5-3B-Instruct PRIME_CODE_ERROR_INJECTION_ENABLED=0 PRIME_CODE_ERROR_INJECTION_PROB=0.0 python ./examples/prime_code_multi_turn/run_prime_multi_turn.py 2>&1 | tee  /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/slime/logs/prime_multi_turn/Qwen2.5_3B_prime_multi_turn.log
+
+# rm -rf ./slime/  && cp -r /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/fault-inject-slime ./slime/
+# cd ./slime && bash ./examples/prime_code_multi_turn/entrypoint.sh

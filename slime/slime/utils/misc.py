@@ -1,20 +1,45 @@
 import importlib
+import importlib.util
+import os
 import subprocess
+from functools import lru_cache
 
 import ray
 
 from slime.utils.http_utils import is_port_available
 
 
-def load_function(path):
+@lru_cache(maxsize=256)
+def _load_function_cached(path: str):
     """
     Load a function from a module.
-    :param path: The path to the function, e.g. "module.submodule.function".
+    :param path: The path to the function.
+        Supported formats:
+        1) "module.submodule.function"
+        2) "/abs/path/to/file.py:function"
     :return: The function object.
     """
+    if ":" in path and path.endswith(":") is False:
+        file_path, _, attr = path.rpartition(":")
+        if file_path.endswith(".py") and file_path.startswith("/"):
+            module_name = f"_slime_dynamic_{abs(hash(file_path))}"
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load module spec from file path: {file_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return getattr(module, attr)
+
     module_path, _, attr = path.rpartition(".")
     module = importlib.import_module(module_path)
     return getattr(module, attr)
+
+
+def load_function(path):
+    # Keep legacy hot-reload escape hatch for debugging.
+    if os.getenv("SLIME_DISABLE_LOAD_FUNCTION_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return _load_function_cached.__wrapped__(path)
+    return _load_function_cached(path)
 
 
 class SingletonMeta(type):

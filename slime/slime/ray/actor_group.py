@@ -1,10 +1,17 @@
 import os
+import time
 
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+
+
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class RayTrainGroup:
@@ -142,4 +149,47 @@ class RayTrainGroup:
         )
 
     def set_rollout_manager(self, rollout_manager):
-        return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+        total = len(self._actor_handlers)
+        logger.info("[RayTrainGroup.set_rollout_manager] submitting to %d actors...", total)
+        refs = [actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers]
+        ref_to_rank = {ref: rank for rank, ref in enumerate(refs)}
+
+        pending = list(refs)
+        completed = 0
+        start = time.perf_counter()
+
+        while pending:
+            ready, pending = ray.wait(pending, num_returns=1, timeout=30)
+            if not ready:
+                logger.info(
+                    "[RayTrainGroup.set_rollout_manager] still waiting: completed=%d/%d, pending=%d, elapsed=%.2fs",
+                    completed,
+                    total,
+                    len(pending),
+                    time.perf_counter() - start,
+                )
+                continue
+
+            ref = ready[0]
+            rank = ref_to_rank[ref]
+            ray.get(ref)
+            completed += 1
+            logger.info(
+                "[RayTrainGroup.set_rollout_manager] actor rank %d done (%d/%d), elapsed=%.2fs",
+                rank,
+                completed,
+                total,
+                time.perf_counter() - start,
+            )
+
+        logger.info(
+            "[RayTrainGroup.set_rollout_manager] all actors done in %.2fs",
+            time.perf_counter() - start,
+        )
+        return None
+
+    def get_train_parallel_config(self):
+        logger.info("[RayTrainGroup.get_train_parallel_config] fetching config from rank 0 actor...")
+        config = ray.get(self._actor_handlers[0].get_train_parallel_config.remote())
+        logger.info("[RayTrainGroup.get_train_parallel_config] fetched config: %s", config)
+        return config

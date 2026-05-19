@@ -1,0 +1,11 @@
+max_turns: 3
+rollout_interaction_env_path: examples.prime_code_multi_turn.env_prime_code
+code_execution_timeout: 2.0
+code_execution_memory_mb: 1024
+code_execution_max_cases: null
+code_execution_eval_max_cases: 16
+code_execution_max_output_chars: 1200
+code_execution_stop_on_first_failure: true
+code_execution_stop_on_first_failure_batch_size: 8
+code_execution_eval_thread_pool_workers: 64
+code_execution_prime_code_dir: /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/verl/verl/utils/reward_score/prime_code

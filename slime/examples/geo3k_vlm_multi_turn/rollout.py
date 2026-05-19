@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
 import importlib
 import importlib.util
+import logging
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +21,91 @@ from slime.utils.http_utils import post
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.types import Sample
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_ENV_MODULE = "examples.vlm_multi_turn.env_geo3k"
+ENV_STEP_THREAD_POOL_WORKERS_ENV = "SLIME_ENV_STEP_THREAD_POOL_WORKERS"
+ENV_STEP_MAX_IN_FLIGHT_ENV = "SLIME_ENV_STEP_MAX_IN_FLIGHT"
+INTERACTION_HEARTBEAT_SEC_ENV = "SLIME_INTERACTION_HEARTBEAT_SEC"
+INTERACTION_LLM_TIMEOUT_SEC_ENV = "SLIME_INTERACTION_LLM_TIMEOUT_SEC"
+INTERACTION_ENV_STEP_TIMEOUT_SEC_ENV = "SLIME_INTERACTION_ENV_STEP_TIMEOUT_SEC"
+DEFAULT_ENV_STEP_THREAD_POOL_WORKERS = 128
+DEFAULT_ENV_STEP_MAX_IN_FLIGHT = max(1, DEFAULT_ENV_STEP_THREAD_POOL_WORKERS // 8)
+DEFAULT_INTERACTION_HEARTBEAT_SEC = 30.0
+DEFAULT_INTERACTION_LLM_TIMEOUT_SEC = 600.0
+DEFAULT_INTERACTION_ENV_STEP_TIMEOUT_SEC = 600.0
+ENV_STEP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(1, int(os.getenv(ENV_STEP_THREAD_POOL_WORKERS_ENV, str(DEFAULT_ENV_STEP_THREAD_POOL_WORKERS)))),
+    thread_name_prefix="interaction-env-step",
+)
+ENV_STEP_MAX_IN_FLIGHT = max(1, int(os.getenv(ENV_STEP_MAX_IN_FLIGHT_ENV, str(DEFAULT_ENV_STEP_MAX_IN_FLIGHT))))
+ENV_STEP_SEMAPHORE: asyncio.Semaphore | None = None
 
 # Dummy messages used for calculating trim length in chat template encoding
 DUMMY_MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "I am a user."},
 ]
+
+
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning("Invalid float env %s=%r, falling back to %.3f", name, raw_value, default)
+        return default
+    if value <= 0:
+        logger.warning("Env %s=%r must be > 0, falling back to %.3f", name, raw_value, default)
+        return default
+    return value
+
+
+def _parse_optional_timeout_env(name: str, default: float | None) -> float | None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"0", "none", "off", "false", "no"}:
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning("Invalid timeout env %s=%r, falling back to %r", name, raw_value, default)
+        return default
+    if value <= 0:
+        return None
+    return value
+
+
+INTERACTION_HEARTBEAT_SEC = _parse_positive_float_env(
+    INTERACTION_HEARTBEAT_SEC_ENV, DEFAULT_INTERACTION_HEARTBEAT_SEC
+)
+INTERACTION_LLM_TIMEOUT_SEC = _parse_optional_timeout_env(
+    INTERACTION_LLM_TIMEOUT_SEC_ENV, DEFAULT_INTERACTION_LLM_TIMEOUT_SEC
+)
+INTERACTION_ENV_STEP_TIMEOUT_SEC = _parse_optional_timeout_env(
+    INTERACTION_ENV_STEP_TIMEOUT_SEC_ENV, DEFAULT_INTERACTION_ENV_STEP_TIMEOUT_SEC
+)
+
+
+def _sample_log_id(sample_metadata: dict | None) -> str:
+    if not sample_metadata:
+        return "sample=unknown"
+    for key in ("index", "sample_index", "rollout_id", "question_id", "task_id", "id"):
+        value = sample_metadata.get(key)
+        if value is not None:
+            return f"{key}={value}"
+    return "sample=unknown"
+
+
+def _get_env_step_semaphore() -> asyncio.Semaphore:
+    global ENV_STEP_SEMAPHORE
+    if ENV_STEP_SEMAPHORE is None:
+        ENV_STEP_SEMAPHORE = asyncio.Semaphore(ENV_STEP_MAX_IN_FLIGHT)
+    return ENV_STEP_SEMAPHORE
 
 
 def _load_env_module(env_path: str | None):
@@ -39,13 +123,13 @@ def _load_env_module(env_path: str | None):
     return importlib.import_module(target)
 
 
-def _build_env(env_module, sample: Sample, args: Any):
+def _build_env(env_module, sample: Sample, args: Any, evaluation: bool = False):
     """Instantiate the interaction environment using the provided module."""
     build_fn = env_module.build_env
     if not callable(build_fn):
         raise ValueError("Environment module must expose a callable `build_env(sample, args)`.")
     try:
-        return build_fn(sample=sample, args=args)
+        return build_fn(sample=sample, args=args, evaluation=evaluation)
     except TypeError:
         # Fallback to positional signature
         return build_fn(sample, args)
@@ -138,7 +222,7 @@ def _merge_multimodal_train_inputs(chunks: list[dict | None]) -> dict | None:
     return merged
 
 
-def _initialize_resources(args: Any, sample: Sample):
+def _initialize_resources(args: Any, sample: Sample, evaluation: bool = False):
     env_module = _load_env_module(args.rollout_interaction_env_path)
     max_turns = args.max_turns
     if max_turns is None:
@@ -146,7 +230,7 @@ def _initialize_resources(args: Any, sample: Sample):
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     sample.metadata = sample.metadata or {}
-    env = _build_env(env_module, sample, args)
+    env = _build_env(env_module, sample, args, evaluation=evaluation)
     config = {"max_turns": max_turns}
     return env, env_module, config, state, url
 
@@ -209,12 +293,24 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     return response_text, new_tokens, new_log_probs, finish_type
 
 
-def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
+def _process_env_step_sync(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
+    sample_id = _sample_log_id(sample_metadata)
+    env_step_start = time.perf_counter()
     observation, done, _ = env.step(response_text)
+    env_step_elapsed = time.perf_counter() - env_step_start
+    logger.info(
+        "interaction env.step %s turn=%s elapsed=%.3fs done=%s response_chars=%d",
+        sample_id,
+        getattr(env, "turn", "unknown"),
+        env_step_elapsed,
+        done,
+        len(response_text),
+    )
     if done:
         return None, None, None, None, True
 
     next_user_message = env.format_observation(observation)
+    encode_start = time.perf_counter()
     obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs = (
         _encode_observation_for_generation(
             tokenizer,
@@ -225,12 +321,126 @@ def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, pr
             args.apply_chat_template_kwargs,
         )
     )
+    encode_elapsed = time.perf_counter() - encode_start
+    logger.info(
+        "interaction observation_encode %s turn=%s elapsed=%.3fs prompt_tokens=%d images=%d",
+        sample_id,
+        getattr(env, "turn", "unknown"),
+        encode_elapsed,
+        len(obs_prompt_ids),
+        len(obs_image_data),
+    )
 
     bos_id = tokenizer.bos_token_id
     if bos_id is not None and obs_prompt_ids and obs_prompt_ids[0] == bos_id:
         obs_prompt_ids = obs_prompt_ids[1:]
 
     return obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs, False
+
+
+async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
+    # Run env.step and observation encoding off the event loop so expensive local tool execution
+    # from one sample does not stall other in-flight interaction environments.
+    loop = asyncio.get_running_loop()
+    sample_id = _sample_log_id(sample_metadata)
+    semaphore = _get_env_step_semaphore()
+    queue_start = time.perf_counter()
+    async with semaphore:
+        queue_elapsed = time.perf_counter() - queue_start
+        if queue_elapsed >= 0.05:
+            logger.info(
+                "interaction env_step_gate %s turn=%s queued=%.3fs in_flight_limit=%d",
+                sample_id,
+                getattr(env, "turn", "unknown"),
+                queue_elapsed,
+                ENV_STEP_MAX_IN_FLIGHT,
+            )
+        executor_start = time.perf_counter()
+        result = await loop.run_in_executor(
+            ENV_STEP_EXECUTOR,
+            _process_env_step_sync,
+            env,
+            response_text,
+            tokenizer,
+            processor,
+            args,
+            sample_metadata,
+        )
+    logger.info(
+        "interaction env_step_executor %s turn=%s elapsed=%.3fs",
+        sample_id,
+        getattr(env, "turn", "unknown"),
+        time.perf_counter() - executor_start,
+    )
+    return result
+
+
+async def _await_with_heartbeat(
+    awaitable,
+    *,
+    sample_id: str,
+    turn: int,
+    phase: str,
+    heartbeat_sec: float,
+    timeout_sec: float | None,
+):
+    task = asyncio.create_task(awaitable)
+    start_time = time.perf_counter()
+    next_heartbeat_at = heartbeat_sec
+    try:
+        while True:
+            elapsed = time.perf_counter() - start_time
+            wait_timeout = heartbeat_sec
+            if timeout_sec is not None:
+                remaining = timeout_sec - elapsed
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                wait_timeout = min(wait_timeout, remaining)
+
+            done, _pending = await asyncio.wait({task}, timeout=wait_timeout, return_when=asyncio.FIRST_COMPLETED)
+            if done:
+                return await task
+
+            elapsed = time.perf_counter() - start_time
+            if timeout_sec is not None and elapsed >= timeout_sec:
+                raise asyncio.TimeoutError
+
+            if elapsed >= next_heartbeat_at:
+                logger.warning(
+                    "interaction heartbeat %s turn=%d phase=%s elapsed=%.3fs timeout=%s",
+                    sample_id,
+                    turn,
+                    phase,
+                    elapsed,
+                    f"{timeout_sec:.3f}s" if timeout_sec is not None else "disabled",
+                )
+                while next_heartbeat_at <= elapsed:
+                    next_heartbeat_at += heartbeat_sec
+    except asyncio.TimeoutError:
+        elapsed = time.perf_counter() - start_time
+        logger.error(
+            "interaction timeout %s turn=%d phase=%s elapsed=%.3fs timeout=%s",
+            sample_id,
+            turn,
+            phase,
+            elapsed,
+            f"{timeout_sec:.3f}s" if timeout_sec is not None else "disabled",
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raise
+
+
+def _mark_sample_timeout(sample: Sample, *, phase: str, turn: int, timeout_sec: float | None) -> None:
+    sample.status = Sample.Status.ABORTED
+    sample.reward = 0.0
+    sample.metadata = sample.metadata or {}
+    sample.metadata["interaction_timeout"] = {
+        "phase": phase,
+        "turn": turn,
+        "timeout_sec": timeout_sec,
+    }
 
 
 def _append_to_sample(
@@ -306,15 +516,16 @@ def _finalize_sample(sample: Sample, tokenizer, response_tokens, multimodal_trai
     return sample
 
 
-async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
+async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
     """Custom multi-turn rollout that interacts with a pluggable environment."""
     assert not args.partial_rollout, "Partial rollout is not supported for interaction rollouts."
 
-    env, env_module, config, state, url = _initialize_resources(args, sample)
+    env, env_module, config, state, url = _initialize_resources(args, sample, evaluation=evaluation)
     sampling_params = sampling_params.copy()
     current_image_data, response_tokens, budget, multimodal_train_inputs_buffer = _prepare_start_state(
         sample, state, args, sampling_params
     )
+    sample_id = _sample_log_id(sample.metadata)
     try:
         env.reset()
         if budget is not None and budget <= 0:
@@ -326,8 +537,31 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             if budget is not None:
                 cur_sampling_params["max_new_tokens"] = budget
 
-            response_text, new_response_tokens, new_response_log_probs, finish_type = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer
+            inference_start = time.perf_counter()
+            try:
+                response_text, new_response_tokens, new_response_log_probs, finish_type = await _await_with_heartbeat(
+                    _run_inference_step(url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer),
+                    sample_id=sample_id,
+                    turn=turn_idx,
+                    phase="llm_generate",
+                    heartbeat_sec=INTERACTION_HEARTBEAT_SEC,
+                    timeout_sec=INTERACTION_LLM_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                _mark_sample_timeout(
+                    sample,
+                    phase="llm_generate",
+                    turn=turn_idx,
+                    timeout_sec=INTERACTION_LLM_TIMEOUT_SEC,
+                )
+                break
+            logger.info(
+                "interaction llm_generate %s turn=%d elapsed=%.3fs output_tokens=%d finish_type=%s",
+                sample_id,
+                turn_idx,
+                time.perf_counter() - inference_start,
+                len(new_response_tokens),
+                finish_type,
             )
             _append_to_sample(sample, response_tokens, new_response_tokens, new_response_log_probs, loss_mask_val=1)
             budget = _update_budget(budget, len(new_response_tokens))
@@ -338,8 +572,32 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 sample.status = Sample.Status.TRUNCATED
                 break
 
-            obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs, done = (
-                _process_env_step(env, response_text, state.tokenizer, state.processor, args, sample.metadata)
+            turn_env_step_start = time.perf_counter()
+            try:
+                obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs, done = (
+                    await _await_with_heartbeat(
+                        _process_env_step(env, response_text, state.tokenizer, state.processor, args, sample.metadata),
+                        sample_id=sample_id,
+                        turn=turn_idx,
+                        phase="env_step",
+                        heartbeat_sec=INTERACTION_HEARTBEAT_SEC,
+                        timeout_sec=INTERACTION_ENV_STEP_TIMEOUT_SEC,
+                    )
+                )
+            except asyncio.TimeoutError:
+                _mark_sample_timeout(
+                    sample,
+                    phase="env_step",
+                    turn=turn_idx,
+                    timeout_sec=INTERACTION_ENV_STEP_TIMEOUT_SEC,
+                )
+                break
+            logger.info(
+                "interaction turn_step %s turn=%d elapsed=%.3fs done=%s",
+                sample_id,
+                turn_idx,
+                time.perf_counter() - turn_env_step_start,
+                done,
             )
             if done:
                 sample.status = Sample.Status.COMPLETED

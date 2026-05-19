@@ -16,11 +16,12 @@ The agent is trained to fix real GitHub issues by writing bash commands inside i
 │    /container/diff                 │
 │    /container/evaluate             │
 │    /container/destroy              │
+│    /container/stats                │
 └────────────────▲───────────────────┘
                  │ HTTP
 ┌─ GPU Head Node─┼───────────────────┐
 │  server/swe_env_pool_server.py     │  ← started by training script
-│    (:18090)  load-balances leases  │
+│    (:18090)  load-balances leases + proxy /stats │
 └────────────────▲───────────────────┘
                  │ HTTP
 ┌─ RolloutManager (Ray Actor) ───────┐
@@ -166,9 +167,10 @@ This can be set per-run or written into `swe-rl/.env.swe` and sourced before lau
 
 ```bash
 # swe-rl/.env.swe
-SWE_EXEC_SERVER_URLS="http://172.16.0.10:5000,..."
-HF_CKPT=/path/to/Qwen3-32B
-PROMPT_DATA=/path/to/train.jsonl
+SWE_EXEC_SERVER_URLS="http://100.101.233.137:5000"
+HF_CKPT=/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/models/Qwen3-4B
+PROMPT_DATA=/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/data/train.jsonl
+MEGATRON_LM_PATH=/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/slime/Megatron-LM
 ```
 
 ---
@@ -223,6 +225,57 @@ The output path must match `REF_LOAD` in the script (default: `${EXPORT_ROOT}/ck
 | `--lr` | 1e-6 | learning rate |
 | `SWE_MAX_CONCURRENT` | 128 | max concurrent Docker containers across all nodes |
 | `SWE_MAX_CONTAINERS_PER_NODE` | 15 | per-node container cap |
+
+### Online Env Docker Scheduler (optional)
+
+Enable online per-prompt docker resource sampling + repo-level profiling + budgeted admission/reorder:
+
+```bash
+export SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER=1
+```
+
+Rollout-only debug (no actor/critic training, useful for scheduler validation):
+
+```bash
+bash swe-rl/scripts/run_swe_rl_online_scheduler_rollout_only_debug.sh
+```
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER` | `0` | enable scheduler |
+| `SWE_SCHED_SAMPLING_INTERVAL_SEC` | `2.0` | docker stats sampling period |
+| `SWE_SCHED_SAFETY_MARGIN` | `0.9` | budget safety margin to reduce oversubscription by jitter |
+| `SWE_SCHED_MAX_UNKNOWN_REPO_CONCURRENCY` | `2` | cap concurrent prompts with no repo history during cold start |
+| `SWE_SCHED_COLD_START_MEMORY_MULTIPLIER` | `2.0` | memory multiplier for unknown repos (safer cold start) |
+| `SWE_SCHED_COLD_START_CPU_MULTIPLIER` | `1.5` | cpu multiplier for unknown repos (safer cold start) |
+| `SWE_SCHED_STARTUP_MAX_ACTIVE_PROMPTS` | `2` | hard cap on active prompts in startup window (extra OOM guard) |
+| `SWE_SCHED_STARTUP_CAP_DURATION_SEC` | `180` | duration of startup active-prompt cap |
+| `SWE_SCHED_MEMORY_BUDGET_BYTES` | `SWE_MAX_CONCURRENT * SWE_SCHED_DEFAULT_MEMORY_BYTES` | memory budget |
+| `SWE_SCHED_CPU_BUDGET_PERCENT` | `SWE_MAX_CONCURRENT * SWE_SCHED_DEFAULT_CPU_PERCENT` | base cpu budget before oversell ratio |
+| `SWE_SCHED_CPU_OVERSELL_RATIO` | `2.0` | cpu oversell factor (`2.0` means allow ~200% cpu overbooking) |
+| `SWE_SCHED_DISK_READ_BUDGET_BYTES` | `SWE_MAX_CONCURRENT * SWE_SCHED_DEFAULT_DISK_READ_BYTES` | disk read budget |
+| `SWE_SCHED_DISK_WRITE_BUDGET_BYTES` | `SWE_MAX_CONCURRENT * SWE_SCHED_DEFAULT_DISK_WRITE_BYTES` | disk write budget |
+| `SWE_SCHED_DEFAULT_MEMORY_BYTES` | `2147483648` | default per-repo memory prediction when no history |
+| `SWE_SCHED_DEFAULT_CPU_PERCENT` | `100` | default per-repo cpu prediction when no history |
+| `SWE_SCHED_DEFAULT_DISK_READ_BYTES` | `2147483648` | default per-repo disk read prediction when no history |
+| `SWE_SCHED_DEFAULT_DISK_WRITE_BYTES` | `2147483648` | default per-repo disk write prediction when no history |
+| `SWE_REPO_RESOURCE_STATS_PATH` | `swe-rl/output/swe_rollouts/repo_resource_stats.json` | persisted repo profile path |
+
+Docker create throttling (to avoid startup `docker run` storms on `dockerd`):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SWE_MAX_CONCURRENT_DOCKER_CREATE` | `1` | max concurrent `allocate`/`docker run` requests per rollout worker |
+| `SWE_DOCKER_CREATE_MIN_INTERVAL_SEC` | `0.5` | minimum interval between two create requests |
+| `SWE_POOL_MAX_TOTAL_LEASES` | `SWE_MAX_CONCURRENT` | global lease cap enforced at pool server |
+| `SWE_POOL_MAX_CONCURRENT_ALLOCATES` | `1` | pool-server global cap for concurrent `/allocate` requests |
+| `SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC` | `0.5` | pool-server minimum interval between two allocates |
+
+When enabled, logs include:
+- per-prompt summary (`peak_memory_bytes`, `avg_cpu_percent`, `disk_read_bytes`, `disk_write_bytes`)
+- repo profile updates
+- per-round reorder plan snapshots
+- delayed admission reasons when resource budgets are exceeded
 
 ### Outputs
 

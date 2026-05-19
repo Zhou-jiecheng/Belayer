@@ -4,6 +4,7 @@ import slime.utils.misc as U
 from slime.utils.external_utils.command_utils import execute_train
 
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-VL-2B-Instruct")
+INJECT_FAULTS = os.environ.get("ENV_FAULT_INJECTION_ENABLED", "0").lower() in ("1", "true", "yes")
 assert MODEL_NAME in {
     "Qwen3-VL-2B-Instruct",
     "Qwen3-VL-4B-Instruct",
@@ -13,14 +14,20 @@ assert MODEL_NAME in {
     "Qwen3-VL-8B-Thinking",
 }
 
-NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
-EXTERNAL_RAY = int(os.environ.get("SLIME_SCRIPT_EXTERNAL_RAY", "0"))
-TRAIN_BACKEND = os.environ.get("SLIME_SCRIPT_TRAIN_BACKEND", "fsdp").lower()
-assert TRAIN_BACKEND in {"fsdp", "megatron"}
 
 DATASET_NAME = "VeraIsHere/geo3k_imgurl_processed"
-DATA_ROOT = "/root/datasets/geo3k_imgurl_processed"
+MODEL_ROOT = os.environ.get("SLIME_SCRIPT_MODEL_ROOT", "/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/models")
+DATA_ROOT = os.environ.get(
+    "SLIME_SCRIPT_DATA_ROOT",
+    "/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/slime/examples/geo3k_vlm_multi_turn/datasets/geo3k_imgurl_processed",
+)
 TRAIN_DATA_PATH = os.path.join(DATA_ROOT, "train.parquet")
+MODEL_PATH = os.path.join(MODEL_ROOT, MODEL_NAME)
+
+NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "8"))
+EXTERNAL_RAY = int(os.environ.get("SLIME_SCRIPT_EXTERNAL_RAY", "0"))
+TRAIN_BACKEND = os.environ.get("SLIME_SCRIPT_TRAIN_BACKEND", "megatron").lower()
+assert TRAIN_BACKEND in {"fsdp", "megatron"}
 
 
 def get_megatron_model_type(model_name: str) -> str:
@@ -40,7 +47,10 @@ def prepare():
 
 
 def execute():
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
+    ckpt_args = (f"--hf-checkpoint {MODEL_PATH} "
+                 f"--save /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/ckpt_{MODEL_NAME}_fault_injection_{INJECT_FAULTS}_fixed_1 "
+                 "--save-interval 50 ")
+
 
     wandb_args = (
         (
@@ -50,7 +60,11 @@ def execute():
             f"--wandb-key '{wandb_api_key}' "
         )
         if (wandb_api_key := os.environ.get("WANDB_API_KEY"))
-        else ""
+        else (  
+            "--use-tensorboard "
+            "--tb-project-name geo3k_vlm_multi_turn "
+            f"--tb-experiment-name {MODEL_NAME}_fault_injection_{INJECT_FAULTS}_fixed_1 " 
+        )
     )
 
     rollout_args = (
@@ -63,7 +77,7 @@ def execute():
         "--custom-generate-function-path examples.geo3k_vlm_multi_turn.rollout.generate "
         "--custom-config-path examples/geo3k_vlm_multi_turn/geo3k_vlm_multi_turn_config.yaml "
         "--rollout-shuffle "
-        "--num-rollout 3000 "
+        "--num-rollout 300 "
         "--rollout-batch-size 64 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 4096 "
@@ -101,6 +115,7 @@ def execute():
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-mem-fraction-static 0.6 "
+        "--use-slime-router "
         f"--sglang-cuda-graph-bs {' '.join(map(str, [1, 2, 4, 8] + list(range(16, 257, 8))))} "
     )
 
@@ -114,7 +129,7 @@ def execute():
 
     megatron_args = (
         "--train-backend megatron "
-        f"--load /root/models/{MODEL_NAME} "
+        f"--load {MODEL_PATH} "
         "--tensor-model-parallel-size 4 "
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
@@ -125,7 +140,7 @@ def execute():
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
         "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 4096 "
+        "--max-tokens-per-gpu 10240 "
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
         "--accumulate-allreduce-grads-in-fp32 "
@@ -135,7 +150,7 @@ def execute():
     )
 
     misc_args = (
-        "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " f"--rollout-num-gpus {NUM_GPUS} " "--colocate "
+        "--actor-num-nodes 1 " f"--actor-num-gpus-per-node 8 " f"--rollout-num-gpus 8 " "--colocate "
     )
 
     if TRAIN_BACKEND == "megatron":
@@ -167,5 +182,5 @@ def execute():
 
 
 if __name__ == "__main__":
-    prepare()
+    # prepare()
     execute()

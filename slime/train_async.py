@@ -19,10 +19,27 @@ def train(args):
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"], pgs.get("prm"))
 
     # create the actor and critic models
+    print("Creating training models...")
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
-
+    print("Training models created.")
     # always update weight first so that sglang has the loaded weights from training.
+
+    def recover_rollout_engines_before_weight_update(context: str) -> int:
+        if args.debug_train_only or args.debug_rollout_only or not args.use_fault_tolerance:
+            return 0
+
+        _, _, num_new_engines = ray.get(rollout_manager.recover_rollout_engines.remote())
+        if num_new_engines > 0:
+            print(
+                f"[train_async] {context}: detected {num_new_engines} rollout engine(s) needing weight-update reconnection; "
+                "weight-update connections will be rebuilt before pushing weights."
+            )
+        return num_new_engines
+
+    print("Updating weights before training...")
+    recover_rollout_engines_before_weight_update("initial weight update")
     actor_model.update_weights()
+    print("Initial weight update completed.")
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -63,6 +80,7 @@ def train(args):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
+            recover_rollout_engines_before_weight_update(f"before weight update at rollout {rollout_id + 1}")
             actor_model.update_weights()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):

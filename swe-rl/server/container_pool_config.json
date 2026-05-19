@@ -1,0 +1,13 @@
+{
+  "use_container_pool": false,
+  "pool_max_size_per_image": 2,
+  "pool_max_total_size": 0,
+  "pool_default_cwd": "/testbed",
+  "pool_create_timeout_sec": 1200,
+  "pool_health_check_timeout_sec": 10,
+  "pool_prewarm_ratio": 1,
+  "pool_prewarm_max_concurrency": 32,
+  "pool_resource_stats_dir": "/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/resource_stats",
+  "checkpoint_min_ready_latency_sec": 2.0,
+  "exec_fault_injection_default_probability": 0.01
+}

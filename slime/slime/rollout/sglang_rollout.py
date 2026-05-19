@@ -2,6 +2,9 @@ import asyncio
 import copy
 import inspect
 import logging
+import math
+import os
+import time
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -18,7 +21,7 @@ from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_fil
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
-from slime.utils.http_utils import get, post
+from slime.utils.http_utils import get, post, post_stream
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
 from slime.utils.types import Sample
@@ -28,6 +31,67 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
+
+
+async def _list_router_worker_urls(args: Namespace) -> list[str]:
+    prefer_legacy_endpoint = parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router
+
+    if prefer_legacy_endpoint:
+        try:
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+            return response["urls"]
+        except Exception as exc:
+            if args.use_slime_router or "404" not in str(exc):
+                raise
+            logger.info(
+                "Router %s:%s does not expose /list_workers; retrying via /workers",
+                args.sglang_router_ip,
+                args.sglang_router_port,
+            )
+
+    response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+    workers = response.get("workers", response if isinstance(response, list) else [])
+    return [worker["url"] for worker in workers]
+
+
+def _online_scheduler_pending_group_target(args: Namespace, target_data_size: int) -> int:
+    target = max(1, int(target_data_size))
+    if os.getenv("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return target
+
+    multiplier = max(1.0, float(os.getenv("SWE_SCHED_PENDING_GROUP_WINDOW_MULTIPLIER", "2.0")))
+    extra = max(0, int(os.getenv("SWE_SCHED_PENDING_GROUP_WINDOW_EXTRA", "0")))
+    cap = int(os.getenv("SWE_SCHED_PENDING_GROUP_WINDOW_CAP", "0"))
+
+    pending_target = max(target, int(math.ceil(target * multiplier)))
+    pending_target = max(pending_target, target + extra)
+    if cap > 0:
+        pending_target = min(pending_target, cap)
+    return max(target, pending_target)
+
+
+def _rolling_refill_enabled() -> bool:
+    return os.getenv("SLIME_ENABLE_ROLLING_OVERSAMPLING_REFILL", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _effective_pending_group_target(args: Namespace, target_data_size: int, rolling_refill_enabled: bool) -> int:
+    pending_group_target = _online_scheduler_pending_group_target(args, target_data_size)
+    requested_group_window = max(1, int(getattr(args, "over_sampling_batch_size", target_data_size)))
+
+    if rolling_refill_enabled:
+        return max(pending_group_target, requested_group_window)
+
+    # When the caller explicitly disables refill and keeps oversampling equal to the
+    # target batch, do not let the online scheduler silently widen the pending window.
+    if requested_group_window <= target_data_size:
+        return target_data_size
+
+    return pending_group_target
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -41,9 +105,22 @@ class GenerateState(metaclass=SingletonMeta):
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self.semaphore = asyncio.Semaphore(
+        base_concurrency = (
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
+        if os.getenv("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # Let online scheduler + SWE-side limiter decide effective in-flight requests.
+            # This avoids an unrelated sglang semaphore (often ~128) becoming the hard cap.
+            scheduler_mode_concurrency = int(os.getenv("SWE_SCHED_INTERNAL_MAX_INFLIGHT", "4096"))
+            sem_concurrency = max(base_concurrency, scheduler_mode_concurrency)
+            logger.info(
+                "GenerateState semaphore override (online scheduler): base=%d -> effective=%d",
+                base_concurrency,
+                sem_concurrency,
+            )
+        else:
+            sem_concurrency = base_concurrency
+        self.semaphore = asyncio.Semaphore(max(1, sem_concurrency))
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -98,6 +175,29 @@ class GenerateState(metaclass=SingletonMeta):
             )
         self.remaining_batch_size += len(samples)
 
+    def submit_generate_tasks_bfs(self, samples: list[list[Sample]]) -> None:
+        max_group_size = max((len(group) for group in samples), default=0)
+        for sample_offset in range(max_group_size):
+            for group in samples:
+                if sample_offset >= len(group):
+                    continue
+
+                sampling_params = self.sampling_params.copy()
+                if getattr(self.args, "sglang_enable_deterministic_inference", False):
+                    sampling_params["sampling_seed"] = self.group_sampling_seeds[sample_offset]
+
+                self.pendings.add(
+                    asyncio.create_task(
+                        generate_and_rm(
+                            self.args,
+                            group[sample_offset],
+                            sampling_params=sampling_params,
+                            evaluation=False,
+                        )
+                    )
+                )
+        self.remaining_batch_size += len(samples)
+
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
@@ -105,7 +205,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    router_generate_path = os.getenv("SLIME_ROUTER_GENERATE_PATH", "/generate")
+    if not router_generate_path.startswith("/"):
+        router_generate_path = f"/{router_generate_path}"
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}{router_generate_path}"
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
@@ -151,7 +254,20 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         if not sample.tokens:  # Initialize sample.tokens for the first turn
             sample.tokens = prompt_ids
 
-    output = await post(url, payload)
+    use_stream_receiver = (
+        not args.use_slime_router
+        and parse(sglang_router.__version__) <= parse("0.2.1")
+        and router_generate_path == "/generate"
+    )
+    if use_stream_receiver:
+        logger.info(
+            "Using streaming receiver for legacy sglang-router generate response: router_version=%s sample_index=%s",
+            sglang_router.__version__,
+            sample.index,
+        )
+        output = await post_stream(url, payload)
+    else:
+        output = await post(url, payload)
 
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
         from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
@@ -162,7 +278,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
-            new_response_tokens, new_response_log_probs = [], []
+            new_response_tokens = output.get("output_ids") or []
+            new_response_log_probs = []
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
@@ -244,16 +361,41 @@ async def generate_and_rm(
 
         # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        if samples_need_reward:
+            rm_start_time = time.time()
+            logger.info(
+                "generate_and_rm entering batched_async_rm batch_size=%s sample_indices=%s",
+                len(samples_need_reward),
+                [sample.index for sample in samples_need_reward[: min(len(samples_need_reward), 8)]],
+            )
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
+        if samples_need_reward:
+            logger.info(
+                "generate_and_rm finished batched_async_rm batch_size=%s elapsed=%.2fs",
+                len(samples_need_reward),
+                time.time() - rm_start_time,
+            )
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
         if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+            rm_start_time = time.time()
+            logger.info(
+                "generate_and_rm entering async_rm sample_index=%s response_len=%s",
+                sample.index,
+                len(sample.response) if sample.response is not None else None,
+            )
+            sample.reward = await async_rm(args, sample, evaluation=evaluation)
+            logger.info(
+                "generate_and_rm finished async_rm sample_index=%s elapsed=%.2fs reward=%s",
+                sample.index,
+                time.time() - rm_start_time,
+                sample.reward,
+            )
 
     return sample
 
@@ -266,6 +408,7 @@ async def generate_and_rm_group(
     if state.aborted:
         return group
 
+    group_start_time = time.time()
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
@@ -276,13 +419,48 @@ async def generate_and_rm_group(
             asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
-    group = await asyncio.gather(*tasks)
+    log_interval = float(os.getenv("SLIME_GROUP_TASK_DEBUG_INTERVAL_SEC", "30"))
+    next_log_time = group_start_time + log_interval
+    pending_tasks = set(tasks)
+    while pending_tasks:
+        timeout = max(0.0, next_log_time - time.time())
+        done, pending_tasks = await asyncio.wait(
+            pending_tasks,
+            timeout=timeout,
+            return_when=asyncio.ALL_COMPLETED if timeout == 0 else asyncio.FIRST_COMPLETED,
+        )
+        if pending_tasks and time.time() >= next_log_time:
+            logger.info(
+                "generate_and_rm_group still running after %.1fs: group_size=%s completed=%s pending=%s sample_indices=%s",
+                time.time() - group_start_time,
+                len(group),
+                len(tasks) - len(pending_tasks),
+                len(pending_tasks),
+                [sample.index for sample in group[: min(len(group), 8)]],
+            )
+            next_log_time = time.time() + log_interval
+
+    group = [task.result() for task in tasks]
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
-        rewards = await batched_async_rm(args, group)
+        rewards = await batched_async_rm(args, group, evaluation=evaluation)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
+
+    elapsed = time.time() - group_start_time
+    if elapsed >= log_interval:
+        statuses = {}
+        for sample in group:
+            status_name = getattr(sample.status, "name", str(sample.status))
+            statuses[status_name] = statuses.get(status_name, 0) + 1
+        logger.info(
+            "generate_and_rm_group completed after %.1fs: group_size=%s statuses=%s sample_indices=%s",
+            elapsed,
+            len(group),
+            statuses,
+            [sample.index for sample in group[: min(len(group), 8)]],
+        )
 
     return group
 
@@ -294,15 +472,55 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
+    async def _list_worker_urls() -> list[str]:
+        return await _list_router_worker_urls(args)
 
-    logger.info(f"Abort request for {urls}")
-    await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
+    async def _abort_urls(urls: list[str]) -> list[Exception]:
+        if not urls:
+            return []
+        logger.info(f"Abort request for {urls}")
+        results = await asyncio.gather(
+            *[post(f"{url}/abort_request", {"abort_all": True}, max_retries=3) for url in urls],
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        for url, result in zip(urls, results, strict=False):
+            if isinstance(result, Exception):
+                logger.warning("Abort request failed for %s: %s", url, result)
+        return failures
+
+    urls = await _list_worker_urls()
+    failures = await _abort_urls(urls)
+    if failures:
+        refreshed_urls = await _list_worker_urls()
+        refreshed_urls = [url for url in refreshed_urls if url not in urls] or refreshed_urls
+        if refreshed_urls:
+            logger.info("Retry abort against refreshed worker list: %s", refreshed_urls)
+            await _abort_urls(refreshed_urls)
+
+    if not args.partial_rollout:
+        pending_tasks = tuple(state.pendings)
+        if pending_tasks:
+            cancel_timeout = float(os.getenv("SLIME_ABORT_CANCEL_TIMEOUT_SEC", "10"))
+            logger.info(
+                "Cancelling %d pending rollout tasks after target batch is reached (timeout=%ss)",
+                len(pending_tasks),
+                cancel_timeout,
+            )
+            for task in pending_tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=cancel_timeout,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "Timed out while draining cancelled rollout tasks; %d tasks still pending",
+                    sum(1 for task in pending_tasks if not task.done()),
+                )
+            state.pendings = {task for task in pending_tasks if not task.done()}
+        return aborted_samples
 
     # make sure all the pending tasks are finished
     count = 0
@@ -314,7 +532,8 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
-            group = task.result()
+            result = task.result()
+            group = result if isinstance(result, list) else [result]
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
@@ -352,45 +571,93 @@ async def generate_rollout_async(
     )
 
     metric_gatherer = MetricGatherer()
+    rollout_start_time = time.time()
+    first_sample_time = None
+    pending_group_samples: dict[int, list[Sample]] = {}
 
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
+    rolling_refill_enabled = _rolling_refill_enabled()
+    pending_group_target = _effective_pending_group_target(args, target_data_size, rolling_refill_enabled)
+    if pending_group_target != target_data_size:
+        logger.info(
+            "Pending window expanded: target_groups=%d -> pending_groups=%d (rolling_refill=%s)",
+            target_data_size,
+            pending_group_target,
+            rolling_refill_enabled,
+        )
+    else:
+        logger.info("Pending window: target_groups=%d (rolling_refill=%s)", target_data_size, rolling_refill_enabled)
+
+    def refill_pending_groups() -> None:
+        while len(data) < target_data_size and state.remaining_batch_size < pending_group_target:
+            if rolling_refill_enabled:
+                # Top up only the missing in-flight groups so oversampling becomes a rolling window
+                # instead of repeatedly over-issuing full batches.
+                refill_size = min(
+                    pending_group_target - state.remaining_batch_size,
+                    args.over_sampling_batch_size,
+                )
+            else:
+                refill_size = args.over_sampling_batch_size
+            samples = data_source(refill_size)
+            state.submit_generate_tasks_bfs(samples)
 
     data = []
     all_data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
-            # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
-            state.submit_generate_tasks(samples)
+        refill_pending_groups()
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            group: list[Sample] = task.result()
+            result = task.result()
+            if isinstance(result, list):
+                completed_samples = result
+            else:
+                completed_samples = [result]
 
             if do_print:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
+                first_sample_time = time.time()
+                sample = completed_samples[0]
                 logger.info(
                     f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
                 )
                 do_print = False
 
-            assert len(group) == args.n_samples_per_prompt
-            all_data.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
-            if not dynamic_filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
-                state.remaining_batch_size -= 1
-                continue
+            for sample in completed_samples:
+                assert sample.group_index is not None
+                group = pending_group_samples.setdefault(sample.group_index, [])
+                group.append(sample)
+                if len(group) != args.n_samples_per_prompt:
+                    continue
 
-            # add the samples to the data
-            # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
-                data.append(group)
-                pbar.update(args.n_samples_per_prompt)
+                group.sort(key=lambda item: item.index)
+                del pending_group_samples[sample.group_index]
+
+                if args.group_rm:
+                    rewards = await batched_async_rm(args, group, evaluation=False)
+                    for group_sample, reward in zip(group, rewards, strict=False):
+                        group_sample.reward = reward
+
+                all_data.append(group)
+                dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+                if not dynamic_filter_output.keep:
+                    metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                    if rolling_refill_enabled:
+                        state.remaining_batch_size -= 1
+                    continue
+
+                if rolling_refill_enabled:
+                    state.remaining_batch_size -= 1
+
+                # add the samples to the data
+                # NOTE: here we have not stored all the unused samples back to the data buffer.
+                if len(data) < target_data_size:
+                    data.append(group)
+                    pbar.update(args.n_samples_per_prompt)
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -418,7 +685,11 @@ async def generate_rollout_async(
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    if first_sample_time is not None:
+        metrics["perf/rollout_time_before_first_sample"] = first_sample_time - rollout_start_time
+
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
@@ -530,9 +801,15 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+
+    def _reward_for_output(sample: Sample):
+        if not reward_key or not isinstance(sample.reward, dict):
+            return sample.reward
+        return sample.reward[reward_key]
+
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [_reward_for_output(sample) for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
         }

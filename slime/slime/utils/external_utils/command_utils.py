@@ -139,7 +139,7 @@ def execute_train(
     runtime_env_json = json.dumps(
         {
             "env_vars": {
-                "PYTHONPATH": "/root/Megatron-LM/",
+                "PYTHONPATH": "/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/Megatron-LM/",
                 # If setting this in FSDP, the computation communication overlapping may have issues
                 **(
                     {}

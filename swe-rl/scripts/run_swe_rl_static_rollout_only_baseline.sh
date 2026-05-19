@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Rollout-only launcher with static concurrency cap baseline.
+#
+# Usage:
+#   bash swe-rl/scripts/run_swe_rl_static_rollout_only_baseline.sh 128
+#   STATIC_MAX_CONCURRENCY=256 bash swe-rl/scripts/run_swe_rl_static_rollout_only_baseline.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SWE_RL_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+SLIME_DIR="$(cd -- "${SWE_RL_DIR}/../slime" &>/dev/null && pwd)"
+
+STATIC_MAX_CONCURRENCY="${STATIC_MAX_CONCURRENCY:-128}"
+if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+    STATIC_MAX_CONCURRENCY="$1"
+    shift
+fi
+
+if ! [[ "${STATIC_MAX_CONCURRENCY}" =~ ^[0-9]+$ ]] || [[ "${STATIC_MAX_CONCURRENCY}" -le 0 ]]; then
+    echo "ERROR: STATIC_MAX_CONCURRENCY must be a positive integer, got '${STATIC_MAX_CONCURRENCY}'"
+    exit 1
+fi
+
+# Keep control-plane concurrency aligned with the requested static concurrency
+# by default; otherwise rollout slots are occupied by tasks waiting for
+# allocate/docker-create, and the effective LLM-side concurrency drains early.
+CONTROL_PLANE_CONCURRENCY="${CONTROL_PLANE_CONCURRENCY:-${STATIC_MAX_CONCURRENCY}}"
+if [[ "${CONTROL_PLANE_CONCURRENCY}" -gt "${STATIC_MAX_CONCURRENCY}" ]]; then
+    CONTROL_PLANE_CONCURRENCY="${STATIC_MAX_CONCURRENCY}"
+fi
+
+# Keep rollout volume small for baseline comparability.
+export DEBUG_MODE=${DEBUG_MODE:-1}
+export NUM_ROLLOUT=${NUM_ROLLOUT:-1}
+export ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-64}
+export N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
+export OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE:-512}
+TARGET_TOTAL_SAMPLES=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+
+# Checkpoint / recovery policy for the real rollout workflow.
+export SWE_CHECKPOINT_POLICY=${SWE_CHECKPOINT_POLICY:-never}
+export SWE_ADAPTIVE_TAIL_ROOT=${SWE_ADAPTIVE_TAIL_ROOT:-${SWE_RL_DIR}/../export/swe_rollouts_profile_20260325_083236}
+export SWE_ADAPTIVE_CHECKPOINT_BUDGET_SEC=${SWE_ADAPTIVE_CHECKPOINT_BUDGET_SEC:-3.5}
+export SWE_ADAPTIVE_DECISION_INTERVAL_SEC=${SWE_ADAPTIVE_DECISION_INTERVAL_SEC:-1.0}
+export SWE_ADAPTIVE_FAILURE_PROB=${SWE_ADAPTIVE_FAILURE_PROB:-0.01}
+export SWE_ADAPTIVE_MIN_DELTA_ENV_COST_SEC=${SWE_ADAPTIVE_MIN_DELTA_ENV_COST_SEC:-0.1}
+export SWE_ADAPTIVE_MIN_STEPS_BETWEEN_CHECKPOINTS=${SWE_ADAPTIVE_MIN_STEPS_BETWEEN_CHECKPOINTS:-1}
+
+# Server-side fault injection for the real rollout workflow.
+export SWE_FAULT_INJECTION_ENABLE=${SWE_FAULT_INJECTION_ENABLE:-0}
+export SWE_FAULT_INJECTION_PROB=${SWE_FAULT_INJECTION_PROB:-0.003}
+
+# Static baseline: disable online scheduler and rely on fixed caps.
+export SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER=${SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER:-0}
+
+# Keep default scheduler configs present (ignored when disabled).
+export SWE_SCHED_VERBOSE_LOGGING=${SWE_SCHED_VERBOSE_LOGGING:-0}
+export SWE_SCHED_USE_REALTIME_SERVER_MEMORY=${SWE_SCHED_USE_REALTIME_SERVER_MEMORY:-0}
+
+export SWE_STATIC_CAPACITY_HEADROOM=${SWE_STATIC_CAPACITY_HEADROOM:-8}
+STATIC_CAPACITY_LIMIT=$((STATIC_MAX_CONCURRENCY + SWE_STATIC_CAPACITY_HEADROOM))
+CONTROL_PLANE_CAPACITY_LIMIT=$((CONTROL_PLANE_CONCURRENCY + SWE_STATIC_CAPACITY_HEADROOM))
+
+# Fixed concurrency caps for baseline.
+export SWE_POOL_MAX_TOTAL_LEASES=${SWE_POOL_MAX_TOTAL_LEASES:-${STATIC_CAPACITY_LIMIT}}
+export SWE_MAX_CONTAINERS_PER_NODE=${SWE_MAX_CONTAINERS_PER_NODE:-${STATIC_CAPACITY_LIMIT}}
+export SWE_MAX_CONCURRENT=${SWE_MAX_CONCURRENT:-${STATIC_MAX_CONCURRENCY}}
+
+# Keep allocate/docker-create throttles configurable.
+export SWE_POOL_MAX_CONCURRENT_ALLOCATES=${SWE_POOL_MAX_CONCURRENT_ALLOCATES:-${CONTROL_PLANE_CAPACITY_LIMIT}}
+export SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC=${SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC:-0.05}
+export SWE_MAX_CONCURRENT_DOCKER_CREATE=${SWE_MAX_CONCURRENT_DOCKER_CREATE:-${CONTROL_PLANE_CAPACITY_LIMIT}}
+export SWE_DOCKER_CREATE_MIN_INTERVAL_SEC=${SWE_DOCKER_CREATE_MIN_INTERVAL_SEC:-0.05}
+export SWE_POOL_CREATE_TIMEOUT_SEC=${SWE_POOL_CREATE_TIMEOUT_SEC:-1800}
+export SWE_POOL_HEALTH_CHECK_FAILURE_THRESHOLD=${SWE_POOL_HEALTH_CHECK_FAILURE_THRESHOLD:-3}
+export SWE_ROLLOUT_TIMEOUT=${SWE_ROLLOUT_TIMEOUT:-1800}
+
+# Avoid the sglang-side semaphore/http client becoming the hidden ceiling in static runs.
+export SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY:-1024}
+
+# Use rollout-only async entrypoint and force debug-rollout-only mode.
+export TRAIN_ASYNC_ENTRY="${SLIME_DIR}/train_async_rollout_only.py"
+export SLIME_EXTRA_ARGS="${SLIME_EXTRA_ARGS:---debug-rollout-only} --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY}"
+
+echo "[static-baseline] STATIC_MAX_CONCURRENCY=${STATIC_MAX_CONCURRENCY}"
+echo "[static-baseline] TRAIN_ASYNC_ENTRY=${TRAIN_ASYNC_ENTRY}"
+echo "[static-baseline] SLIME_EXTRA_ARGS=${SLIME_EXTRA_ARGS}"
+echo "[static-baseline] SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER=${SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER}"
+echo "[static-baseline] SWE_STATIC_CAPACITY_HEADROOM=${SWE_STATIC_CAPACITY_HEADROOM}"
+echo "[static-baseline] STATIC_CAPACITY_LIMIT=${STATIC_CAPACITY_LIMIT}"
+echo "[static-baseline] CONTROL_PLANE_CAPACITY_LIMIT=${CONTROL_PLANE_CAPACITY_LIMIT}"
+echo "[static-baseline] SWE_POOL_MAX_TOTAL_LEASES=${SWE_POOL_MAX_TOTAL_LEASES}"
+echo "[static-baseline] SWE_MAX_CONTAINERS_PER_NODE=${SWE_MAX_CONTAINERS_PER_NODE}"
+echo "[static-baseline] SWE_MAX_CONCURRENT=${SWE_MAX_CONCURRENT}"
+echo "[static-baseline] SWE_POOL_MAX_CONCURRENT_ALLOCATES=${SWE_POOL_MAX_CONCURRENT_ALLOCATES}"
+echo "[static-baseline] SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC=${SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC}"
+echo "[static-baseline] SWE_POOL_CREATE_TIMEOUT_SEC=${SWE_POOL_CREATE_TIMEOUT_SEC}"
+echo "[static-baseline] SWE_POOL_HEALTH_CHECK_FAILURE_THRESHOLD=${SWE_POOL_HEALTH_CHECK_FAILURE_THRESHOLD}"
+echo "[static-baseline] SWE_ROLLOUT_TIMEOUT=${SWE_ROLLOUT_TIMEOUT}"
+echo "[static-baseline] SWE_MAX_CONCURRENT_DOCKER_CREATE=${SWE_MAX_CONCURRENT_DOCKER_CREATE}"
+echo "[static-baseline] SWE_DOCKER_CREATE_MIN_INTERVAL_SEC=${SWE_DOCKER_CREATE_MIN_INTERVAL_SEC}"
+echo "[static-baseline] SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY}"
+echo "[static-baseline] NUM_ROLLOUT=${NUM_ROLLOUT}"
+echo "[static-baseline] ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE}"
+echo "[static-baseline] N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT}"
+echo "[static-baseline] OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE}"
+echo "[static-baseline] TARGET_TOTAL_SAMPLES_PER_ROLLOUT=${TARGET_TOTAL_SAMPLES}"
+echo "[static-baseline] SWE_CHECKPOINT_POLICY=${SWE_CHECKPOINT_POLICY}"
+echo "[static-baseline] SWE_ADAPTIVE_TAIL_ROOT=${SWE_ADAPTIVE_TAIL_ROOT}"
+echo "[static-baseline] SWE_ADAPTIVE_CHECKPOINT_BUDGET_SEC=${SWE_ADAPTIVE_CHECKPOINT_BUDGET_SEC}"
+echo "[static-baseline] SWE_ADAPTIVE_DECISION_INTERVAL_SEC=${SWE_ADAPTIVE_DECISION_INTERVAL_SEC}"
+echo "[static-baseline] SWE_ADAPTIVE_FAILURE_PROB=${SWE_ADAPTIVE_FAILURE_PROB}"
+echo "[static-baseline] SWE_ADAPTIVE_MIN_DELTA_ENV_COST_SEC=${SWE_ADAPTIVE_MIN_DELTA_ENV_COST_SEC}"
+echo "[static-baseline] SWE_ADAPTIVE_MIN_STEPS_BETWEEN_CHECKPOINTS=${SWE_ADAPTIVE_MIN_STEPS_BETWEEN_CHECKPOINTS}"
+echo "[static-baseline] SWE_FAULT_INJECTION_ENABLE=${SWE_FAULT_INJECTION_ENABLE}"
+echo "[static-baseline] SWE_FAULT_INJECTION_PROB=${SWE_FAULT_INJECTION_PROB}"
+
+SECONDS=0
+bash "${SCRIPT_DIR}/run_swe_rl.sh" "$@"
+exit_code=$?
+elapsed_seconds=${SECONDS}
+echo "[static-baseline] E2E_WALL_TIME_SECONDS=${elapsed_seconds}"
+echo "[static-baseline] EXIT_CODE=${exit_code}"
+exit "${exit_code}"

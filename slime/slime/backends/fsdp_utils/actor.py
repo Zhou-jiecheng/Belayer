@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from itertools import accumulate
 
@@ -726,14 +727,39 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if self.args.use_fault_tolerance:
+            if dist.get_rank() == 0:
+                ray.get(self.rollout_manager.recover_rollout_engines.remote())
+            dist.barrier(group=get_gloo_group())
+
         rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote()
         )
+        reconnect_debug_state = ray.get(self.rollout_manager.get_weight_update_reconnect_debug_state.remote())
+        pending_shadow_reconnects = reconnect_debug_state["pending_shadow_handover_reconnects"]
+        if pending_shadow_reconnects > 0 and num_new_engines <= 0:
+            raise RuntimeError(
+                "Shadow handover requires a weight-update reconnect, but update_weights observed no pending rollout "
+                f"engine reconnects. debug_state={reconnect_debug_state}"
+            )
         if num_new_engines > 0:
+            reconnect_start_time = time.perf_counter()
+            if dist.get_rank() == 0:
+                logger.info(
+                    "Rebuilding weight-update connections for %s rollout engine(s) before FSDP update_weights",
+                    num_new_engines,
+                )
             self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
+                ray.get(self.rollout_manager.clear_num_new_engines.remote(consumed=num_new_engines))
+                if pending_shadow_reconnects > 0:
+                    ray.get(self.rollout_manager.ack_shadow_handover_weight_update_reconnect.remote())
+                logger.info(
+                    "Weight-update reconnect finished in %.3fs for %s rollout engine(s) before FSDP update_weights",
+                    time.perf_counter() - reconnect_start_time,
+                    num_new_engines,
+                )
 
         self.weight_updater.update_weights()
 

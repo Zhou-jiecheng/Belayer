@@ -1,0 +1,30 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
+export MODEL_ARGS_FILE="${SCRIPT_DIR}/../models/qwen3-32B.sh"
+export MODEL_PATH="/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/models/Qwen3-32B"
+export TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-8}"
+export ROLLOUT_GPU_SET_CSV="${ROLLOUT_GPU_SET_CSV:-0,1,2,3,4,5,6,7}"
+
+export CI_FAULT_INJECTION_ENABLE=1
+export SLIME_ROUTER_REROUTE_FAILED_REQUESTS_TO_HEALTHY_WORKERS=1
+
+# no token level recovery
+export SLIME_ROUTER_DISABLE_TOKEN_LEVEL_RECOVERY=0
+export SLIME_ROUTER_GENERATE_CHECKPOINT_TOKENS=256
+export SLIME_ROUTER_GENERATE_COALESCE_CHUNKS=256
+
+# fault inject
+export CI_FAULT_INJECTION_DELAY_SEC=0
+export CI_FAULT_INJECTION_MODE="mid_generate"
+export CI_FAULT_INJECTION_ROLLOUT_ID_THRESHOLD=0
+export CI_FAULT_INJECTION_PROGRESS_FRACTION=0.3
+export CI_FAULT_INJECTION_MID_DELAY_SEC=0
+export CI_FAULT_INJECTION_ENGINE_INDEX=1
+export CI_FAULT_INJECTION_MID_FALLBACK_SEC=80
+
+
+exec "${SCRIPT_DIR}/run-no-fast-restart-weight-update-smoke-32gpu.sh" "$@"

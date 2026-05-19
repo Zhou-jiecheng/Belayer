@@ -1,0 +1,11 @@
+rjob submit --name=swe-rl-adaptive-checkpoint-16-gpu --gpu=8 --memory=1500000 --cpu=128 \
+--charged-group=stu --private-machine=group \
+--mount=gpfs://gpfs1/ailab-sys:/mnt/shared-storage-user/ailab-sys \
+--image=registry.h.pjlab.org.cn/ailab-sys-sys_gpu/swe-rl:litellm_1_18_1 \
+-P 2 \
+--host-network=true \
+--negative-tags node/gpu-lg-cmc-h-h200-1113.host.h.pjlab.org.cn \
+--custom-resources rdma/mlnx_shared=8 \
+--custom-resources mellanox.com/mlnx_rdma=1 \
+-e DISTRIBUTED_JOB=true \
+-- bash -exc /mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/scripts/launch_script/run_swe_rl_static_checkpoint_256_16gpu_qwen3-32b.sh

@@ -5,10 +5,16 @@ Answer checker API that uses sympy to simplify expressions and check for equalit
 Call grade_answer(given_answer: str, ground_truth: str).
 """
 import re
+import logging
+import os
+import time
 
 import sympy
 from pylatexenc import latex2text
 from sympy.parsing import sympy_parser
+
+logger = logging.getLogger(__name__)
+SLOW_SYMPY_LOG_SEC = float(os.getenv("SLIME_RM_SLOW_LOG_SEC", "1.0"))
 
 
 # Dan Hendrycks' code
@@ -422,6 +428,7 @@ def extract_boxed_answer(solution: str) -> str:
 
 
 def grade_answer_sympy(given_answer: str, ground_truth: str) -> bool:
+    start_time = time.monotonic()
     ground_truth_normalized = _normalize(ground_truth)
     given_normalized = _normalize(given_answer)
 
@@ -456,6 +463,18 @@ def grade_answer_sympy(given_answer: str, ground_truth: str) -> bool:
                 is_correct = are_equal_under_sympy(ground_truth_elem, given_elem)
             if not is_correct:
                 break
+
+    elapsed = time.monotonic() - start_time
+    if elapsed >= SLOW_SYMPY_LOG_SEC:
+        logger.warning(
+            "grade_answer_sympy slow: elapsed=%.2fs gt_norm=%r given_norm=%r gt_elems=%s given_elems=%s result=%s",
+            elapsed,
+            ground_truth_normalized[:120] if ground_truth_normalized is not None else None,
+            given_normalized[:120] if given_normalized is not None else None,
+            len(ground_truth_elems),
+            len(given_elems),
+            is_correct,
+        )
 
     return is_correct
 

@@ -69,7 +69,7 @@ class RadixTreeMiddleware(BaseHTTPMiddleware):
 
         path = request.url.path
 
-        if path != "/generate":
+        if path not in {"/generate", "/generate_nonstream"}:
             return await call_next(request)
 
         request_json = await request.json()

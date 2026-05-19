@@ -50,6 +50,12 @@ else
     exit 1
 fi
 
+if [ -f ~/container_pool_config.json ]; then
+    cp ~/container_pool_config.json /opt/swe-exec-server/container_pool_config.json
+elif [ -f "$(dirname "$0")/container_pool_config.json" ]; then
+    cp "$(dirname "$0")/container_pool_config.json" /opt/swe-exec-server/container_pool_config.json
+fi
+
 cat > /etc/systemd/system/swe-exec-server.service <<'EOF'
 [Unit]
 Description=SWE Docker Exec Server

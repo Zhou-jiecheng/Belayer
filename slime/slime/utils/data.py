@@ -51,9 +51,12 @@ def read_file(path):
 
         def parquet_reader(p):
             pf = pq.ParquetFile(p)
-
-            for batch in pf.iter_batches():
-                yield from batch.to_pylist()
+            # `iter_batches()` can fail on nested/chunked parquet columns, which are
+            # common in multi-turn datasets with message lists and structured metadata.
+            # Reading row groups directly is slower but robust for these schemas.
+            for row_group_index in range(pf.metadata.num_row_groups):
+                table = pf.read_row_group(row_group_index)
+                yield from table.to_pylist()
 
         reader = parquet_reader(path)
 
@@ -113,7 +116,7 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 
 
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
-    prompt = data.get(prompt_key)
+    prompt = _get_nested_value(data, prompt_key)
 
     if isinstance(prompt, str):
         # If prompt is a string and we don't apply chat template, return the prompt as is.
@@ -165,6 +168,19 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     return prompt
 
 
+def _get_nested_value(data: dict, key: str | None, default=None):
+    if key is None:
+        return default
+
+    current = data
+    for part in key.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return default
+    return current
+
+
 class Dataset:
     def __init__(
         self,
@@ -188,10 +204,11 @@ class Dataset:
             as_conversation = apply_chat_template or (multimodal_keys is not None)
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
 
-            metadata = data.get(metadata_key) or {}
+            metadata = _get_nested_value(data, metadata_key) or {}
             tools = None
-            if tool_key is not None and tool_key in data:
-                tools = data[tool_key]
+            tools_value = _get_nested_value(data, tool_key)
+            if tool_key is not None and tools_value is not None:
+                tools = tools_value
                 if isinstance(tools, str):
                     tools = json.loads(tools)
                 elif isinstance(tools, np.ndarray):
@@ -223,7 +240,7 @@ class Dataset:
             origin_samples.append(
                 Sample(
                     prompt=output_prompt,
-                    label=data[label_key] if label_key is not None else None,
+                    label=_get_nested_value(data, label_key) if label_key is not None else None,
                     metadata=metadata,
                     multimodal_inputs=multimodal_inputs,
                 )

@@ -2,6 +2,55 @@ import re
 import torch
 
 
+def _convert_vision_name_to_sglang(name: str) -> str:
+    if not name.startswith("model.visual."):
+        return name
+
+    vision_name = name[len("model.visual.") :]
+
+    merger_pat = r"(?:decoder\.)?merger\.(.+)"
+    m = re.match(merger_pat, vision_name)
+    if m:
+        rest = m.group(1)
+        rest = re.sub(r"^patch_norm\.", "norm.", rest)
+        return f"model.visual.merger.{rest}"
+
+    deepstack_merger_pat = r"(?:decoder\.)?deepstack_merger_list\.(\d+)\.(.+)"
+    m = re.match(deepstack_merger_pat, vision_name)
+    if m:
+        layer_idx, rest = m.groups()
+        rest = re.sub(r"^patch_norm\.", "norm.", rest)
+        return f"model.visual.deepstack_merger_list.{layer_idx}.{rest}"
+
+    layer_pat = r"decoder\.layers\.(\d+)\.(.+)"
+    m = re.match(layer_pat, vision_name)
+    if not m:
+        return name
+
+    layer_idx, rest = m.groups()
+    prefix = f"model.visual.blocks.{layer_idx}"
+
+    rest_mapping = {
+        "self_attention.linear_proj.weight": "attn.proj.weight",
+        "self_attention.linear_proj.bias": "attn.proj.bias",
+        "self_attention.linear_qkv.weight": "attn.qkv_proj.weight",
+        "self_attention.linear_qkv.bias": "attn.qkv_proj.bias",
+        "self_attention.linear_qkv.layer_norm_weight": "norm1.weight",
+        "self_attention.linear_qkv.layer_norm_bias": "norm1.bias",
+        "mlp.linear_fc1.layer_norm_weight": "norm2.weight",
+        "mlp.linear_fc1.layer_norm_bias": "norm2.bias",
+        "mlp.linear_fc1.weight": "mlp.linear_fc1.weight",
+        "mlp.linear_fc1.bias": "mlp.linear_fc1.bias",
+        "mlp.linear_fc2.weight": "mlp.linear_fc2.weight",
+        "mlp.linear_fc2.bias": "mlp.linear_fc2.bias",
+    }
+
+    if rest in rest_mapping:
+        return f"{prefix}.{rest_mapping[rest]}"
+
+    return name
+
+
 def convert_qwen3vl_to_hf(args, name, param):
     if name.startswith("module.module.language_model."):
         name = "module.module." + name[len("module.module.language_model.") :]
@@ -12,6 +61,7 @@ def convert_qwen3vl_to_hf(args, name, param):
 
     if name.startswith("module.module.vision_model."):
         hf_name = "model.visual." + name[len("module.module.vision_model.") :]
+        hf_name = _convert_vision_name_to_sglang(hf_name)
         return [(hf_name, param)]
 
     if name == "module.module.embedding.word_embeddings.weight":
