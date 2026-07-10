@@ -47,18 +47,88 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
             0.0,
         )
 
-    def test_latest_ready_from_records_preserves_step_zero(self):
-        checkpoint_id, step_idx = fault_tool._latest_ready_from_records(
-            [
-                {
-                    "checkpoint_id": "ckpt-0",
-                    "step_idx": 0,
-                    "status_result": {"status": "ready", "step_idx": 0, "ready_at": 10.0},
-                }
-            ]
+    def test_checkpoint_overhead_annotation_computes_critical_path(self):
+        event = {
+            "create_call_elapsed_sec": 5.0,
+            "create_result": {"ok": True, "size_bytes": 1234},
+            "status_result": {"status": "ready"},
+        }
+
+        fault_tool._annotate_checkpoint_overhead(
+            event,
+            overlap_budget_sec=2.0,
+            overlap_source="next_llm_response",
+        )
+
+        self.assertEqual(event["checkpoint_size_bytes"], 1234)
+        self.assertAlmostEqual(event["checkpoint_elapsed_sec"], 5.0)
+        self.assertAlmostEqual(event["overlapped_checkpoint_sec"], 2.0)
+        self.assertAlmostEqual(event["critical_path_overhead_sec"], 3.0)
+        self.assertEqual(event["overlap_source"], "next_llm_response")
+
+    def test_checkpoint_overhead_summary_aggregates_successful_events(self):
+        reports = [
+            {
+                "checkpoint_events": [
+                    {
+                        "create_result": {"ok": True},
+                        "checkpoint_elapsed_sec": 5.0,
+                        "critical_path_overhead_sec": 3.0,
+                        "overlapped_checkpoint_sec": 2.0,
+                        "checkpoint_size_bytes": 100,
+                    },
+                    {
+                        "skipped": True,
+                        "create_result": {"ok": False},
+                        "checkpoint_elapsed_sec": 9.0,
+                    },
+                ]
+            },
+            {
+                "checkpoint_events": [
+                    {
+                        "create_result": {"ok": True},
+                        "checkpoint_elapsed_sec": 1.0,
+                        "critical_path_overhead_sec": 0.0,
+                        "overlapped_checkpoint_sec": 1.0,
+                        "checkpoint_size_bytes": 300,
+                    }
+                ]
+            },
+        ]
+
+        events = fault_tool._successful_checkpoint_overhead_events(reports)
+        summary = fault_tool._summarize_checkpoint_overhead_events(events)
+
+        self.assertEqual(summary["checkpoint_count"], 2)
+        self.assertAlmostEqual(summary["total_checkpoint_elapsed_sec"], 6.0)
+        self.assertAlmostEqual(summary["total_critical_path_overhead_sec"], 3.0)
+        self.assertAlmostEqual(summary["total_overlapped_checkpoint_sec"], 3.0)
+        self.assertAlmostEqual(summary["overlap_fraction"], 0.5)
+        self.assertEqual(summary["total_checkpoint_size_bytes"], 400)
+
+    def test_promote_latest_ready_preserves_step_zero(self):
+        checkpoint_id, step_idx, resume_step_idx, protected_env, protected_llm, promoted = (
+            fault_tool._promote_latest_ready_checkpoint(
+                latest_ready_checkpoint_id=None,
+                latest_ready_checkpoint_step=-1,
+                latest_ready_resume_step_idx=0,
+                latest_ready_protected_env_cost_sec=0.0,
+                latest_ready_protected_llm_cost_sec=0.0,
+                checkpoint_id="ckpt-0",
+                step_idx=0,
+                resume_step_idx=1,
+                ready_at=10.0,
+                protected_env_cost_sec=2.0,
+                protected_llm_cost_sec=3.0,
+            )
         )
         self.assertEqual(checkpoint_id, "ckpt-0")
         self.assertEqual(step_idx, 0)
+        self.assertEqual(resume_step_idx, 1)
+        self.assertAlmostEqual(protected_env, 2.0)
+        self.assertAlmostEqual(protected_llm, 3.0)
+        self.assertTrue(promoted)
 
     def test_should_probe_in_llm_bubble_allows_only_one_probe(self):
         self.assertTrue(
@@ -74,39 +144,41 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
             )
         )
 
-    def test_select_injections_longest_picks_longest_trajectories(self):
-        traj_paths = [Path("/tmp/a/traj.json"), Path("/tmp/b/traj.json"), Path("/tmp/c/traj.json")]
-        step_counts = {
-            str(traj_paths[0]): 5,
-            str(traj_paths[1]): 12,
-            str(traj_paths[2]): 9,
-        }
+    def test_build_probability_injection_plan_selects_each_candidate_step_at_probability_one(self):
+        traj_path = Path("/tmp/a/traj.json")
 
         def fake_load_traj_steps(path: str):
-            count = step_counts[path]
-            steps = [types.SimpleNamespace(llm_elapsed=1.0) for _ in range(count)]
+            self.assertEqual(path, str(traj_path))
+            steps = [types.SimpleNamespace(llm_elapsed=1.0) for _ in range(5)]
             return "inst", steps
 
         with mock.patch.object(fault_tool, "_load_traj_steps", side_effect=fake_load_traj_steps):
-            out = fault_tool._select_injections(
-                traj_paths,
+            out = fault_tool._build_probability_injection_plan(
+                [
+                    fault_tool.ReplayTrajectory(
+                        source_path=traj_path,
+                        logical_index=0,
+                        cycle_index=0,
+                        sequence_index=0,
+                    )
+                ],
                 seed=123,
-                injection_count=2,
-                selection_mode="longest",
+                injection_probability=1.0,
             )
 
-        self.assertEqual(
-            [item.traj_path for item in out],
-            [str(traj_paths[1].resolve()), str(traj_paths[2].resolve())],
-        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].inject_before_step_indices, [1, 2, 3, 4])
 
     def test_run_policy_runs_global_gc_once_after_batch(self):
-        async def fake_run_one_trajectory(traj_path, policy, injection_target, args, *, defer_gc_until_batch_end=False):
+        async def fake_run_one_trajectory(replay_traj, policy, injection_target, args, *, defer_gc_until_batch_end=False):
             return {
-                "traj_path": str(traj_path.resolve()),
+                "traj_key": replay_traj.key,
+                "traj_label": replay_traj.report_name,
+                "traj_path": str(replay_traj.source_path.resolve()),
                 "policy": policy,
                 "ok": True,
                 "gc_result": {"skip_reason": "deferred_to_batch_end"} if defer_gc_until_batch_end else None,
+                "checkpoint_events": [],
                 "metrics": {
                     "wall_time_sec": 1.0,
                     "checkpoint_attempts": 0,
@@ -141,7 +213,14 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
                 traj_dir.mkdir()
                 traj_path = traj_dir / "traj.json"
                 traj_path.write_text("{}", encoding="utf-8")
-                traj_paths.append(traj_path)
+                traj_paths.append(
+                    fault_tool.ReplayTrajectory(
+                        source_path=traj_path,
+                        logical_index=len(traj_paths),
+                        cycle_index=0,
+                        sequence_index=len(traj_paths),
+                    )
+                )
             out_dir = root / "out"
             args = types.SimpleNamespace(
                 max_concurrency=2,
@@ -149,6 +228,7 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
                 gc_dry_run=False,
                 gc_min_checkpoint_count=100,
                 base_url="http://127.0.0.1:5000",
+                injection_probability=0.0,
             )
             with mock.patch.object(fault_tool, "_run_one_trajectory", new=fake_run_one_trajectory), mock.patch.object(
                 fault_tool, "_maybe_run_checkpoint_gc", new=fake_maybe_run_checkpoint_gc
@@ -248,8 +328,7 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
                 trajectory_root=str(root),
                 limit=1,
                 injection_seed=20260407,
-                injection_count=0,
-                injection_selection="random",
+                injection_probability=0.0,
                 output_root=str(out_root),
                 gc_keep_latest=0,
                 gc_dry_run=False,
@@ -258,7 +337,7 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
                 gc_drain_poll_interval_sec=0.25,
             )
             with mock.patch.object(fault_tool, "_collect_traj_paths", return_value=[traj_dir / "traj.json"]), mock.patch.object(
-                fault_tool, "_select_injections", return_value=[]
+                fault_tool, "_build_probability_injection_plan", return_value=[]
             ), mock.patch.object(fault_tool, "_run_policy", new=fake_run_policy), mock.patch.object(
                 fault_tool, "_wait_for_global_gc_drain", new=fake_wait_for_global_gc_drain
             ), mock.patch.object(

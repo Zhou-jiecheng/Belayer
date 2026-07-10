@@ -1,3 +1,6 @@
 {
-    "git.ignoreLimitWarning": true
+    "git.autorefresh": true,
+    "git.decorations.enabled": true,
+    "git.ignoreLimitWarning": true,
+    "scm.alwaysShowRepositories": true
 }

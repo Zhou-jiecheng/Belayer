@@ -7,10 +7,13 @@ remote Docker containers via the pool server.  Modeled after gui/env_client.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import time
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     from loguru import logger
@@ -19,7 +22,10 @@ except Exception:  # pragma: no cover
 
     logger = logging.getLogger("swe.env_client")
 
-from slime.utils.http_utils import post
+try:
+    from slime.utils.http_utils import post as slime_http_post
+except Exception:  # pragma: no cover - standalone replay may not have slime installed
+    slime_http_post = None
 
 
 class SweEnvClient:
@@ -30,10 +36,63 @@ class SweEnvClient:
         self.evaluate_max_retries = int(os.getenv("SWE_EVALUATE_MAX_RETRIES", "3"))
         self.app_error_max_retries = int(os.getenv("SWE_ENV_APP_MAX_RETRIES", "3"))
         self.allocate_app_max_retries = int(os.getenv("SWE_ALLOCATE_APP_MAX_RETRIES", "360"))
+        self.default_http_timeout_sec = float(os.getenv("SWE_ENV_HTTP_TIMEOUT_SEC", "30"))
+        self.evaluate_http_timeout_sec = float(os.getenv("SWE_EVALUATE_HTTP_TIMEOUT_SEC", "0") or "0")
         self.checkpoint_timeout_sec = float(os.getenv("SWE_CHECKPOINT_TIMEOUT_SEC", "10"))
         self.app_error_retry_delay_sec = float(os.getenv("SWE_ENV_APP_RETRY_DELAY_SEC", "1.0"))
         self.app_error_retry_jitter_sec = float(os.getenv("SWE_ENV_APP_RETRY_JITTER_SEC", "0.2"))
         self.app_error_retry_max_delay_sec = float(os.getenv("SWE_ENV_APP_RETRY_MAX_DELAY_SEC", "5.0"))
+
+    def _post_blocking(self, path: str, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        req = urllib_request.Request(
+            f"{self.base_url}/{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"Unexpected response payload for POST {path}: {parsed!r}")
+        return parsed
+
+    async def _post_once_urllib(self, path: str, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        return await asyncio.to_thread(self._post_blocking, path, payload, timeout)
+
+    @staticmethod
+    def _should_fallback_to_urllib(exc: Exception) -> bool:
+        text = str(exc)
+        return (
+            "'NoneType' object has no attribute 'post'" in text
+            or "_http_client" in text
+            or "http client" in text.lower()
+        )
+
+    async def _post_once(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        timeout: float = 30.0,
+        use_slime: bool = True,
+    ) -> dict[str, Any]:
+        if use_slime and slime_http_post is not None:
+            try:
+                out = await slime_http_post(
+                    f"{self.base_url}/{path}",
+                    payload,
+                    max_retries=1,
+                )
+                if not isinstance(out, dict):
+                    raise RuntimeError(f"slime http post returned non-dict payload: {out!r}")
+                return out
+            except Exception as exc:
+                if not self._should_fallback_to_urllib(exc):
+                    raise
+        return await self._post_once_urllib(path, payload, timeout=timeout)
 
     async def _post_with_retry(
         self,
@@ -43,16 +102,22 @@ class SweEnvClient:
         op_name: str,
         http_max_retries: int,
         app_max_retries: int | None = None,
+        http_timeout: float | None = None,
+        use_slime: bool = True,
     ) -> dict[str, Any]:
         max_attempts = max(1, int(app_max_retries or self.app_error_max_retries))
+        request_timeout = float(http_timeout if http_timeout is not None else self.default_http_timeout_sec)
         last_out: dict[str, Any] | None = None
         for attempt in range(1, max_attempts + 1):
-            out = await post(
-                f"{self.base_url}/{path}",
-                payload,
-                max_retries=http_max_retries,
-            )
-            last_out = out if isinstance(out, dict) else {"ok": False, "error": str(out)}
+            try:
+                out = await self._post_once(path, payload, timeout=request_timeout, use_slime=use_slime)
+                last_out = out if isinstance(out, dict) else {"ok": False, "error": str(out)}
+            except Exception as exc:
+                last_out = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "retryable": True,
+                }
             if last_out.get("ok", False):
                 return last_out
 
@@ -115,11 +180,7 @@ class SweEnvClient:
         checkpoint_id = payload.get("checkpoint_id")
         try:
             out = await asyncio.wait_for(
-                post(
-                    f"{self.base_url}/{path}",
-                    payload,
-                    max_retries=1,
-                ),
+                self._post_once(path, payload, timeout=self.checkpoint_timeout_sec),
                 timeout=self.checkpoint_timeout_sec,
             )
         except Exception as exc:
@@ -199,6 +260,18 @@ class SweEnvClient:
             app_max_retries=self.allocate_app_max_retries,
         )
 
+    def _get_blocking(self, path: str, timeout: float = 30.0) -> dict[str, Any]:
+        req = urllib_request.Request(f"{self.base_url}/{path}", method="GET")
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"Unexpected response payload for GET {path}: {parsed!r}")
+        return parsed
+
+    async def status(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_blocking, "status", 30.0)
+
     async def heartbeat(self, lease_id: str) -> None:
         await self._post_with_retry(
             path="heartbeat",
@@ -210,7 +283,8 @@ class SweEnvClient:
     async def exec(self, lease_id: str, command: str, cwd: str = "/testbed",
                    timeout: int = 180, env: dict | None = None,
                    fault_injection_armed: bool = False,
-                   fault_injection_probability: float | None = None) -> dict[str, Any]:
+                   fault_injection_probability: float | None = None,
+                   fault_injection_spec: dict[str, Any] | None = None) -> dict[str, Any]:
         """Execute a command in the container. Returns {ok, returncode, output}."""
         payload: dict[str, Any] = {
             "lease_id": lease_id,
@@ -222,6 +296,8 @@ class SweEnvClient:
         }
         if fault_injection_probability is not None:
             payload["fault_injection_probability"] = float(fault_injection_probability)
+        if fault_injection_spec:
+            payload["fault_injection_spec"] = dict(fault_injection_spec)
         return await self._post_with_retry(
             path="exec",
             payload=payload,
@@ -242,6 +318,12 @@ class SweEnvClient:
     async def evaluate(self, lease_id: str, patch: str, eval_script: str,
                        cwd: str = "/testbed", timeout: int = 3600) -> dict[str, Any]:
         """Apply patch + run eval script. Returns {ok, resolved, ...}."""
+        eval_timeout = max(1, int(timeout))
+        http_timeout = (
+            self.evaluate_http_timeout_sec
+            if self.evaluate_http_timeout_sec > 0
+            else float(eval_timeout + 60)
+        )
         return await self._post_with_retry(
             path="evaluate",
             payload={
@@ -249,11 +331,13 @@ class SweEnvClient:
                 "patch": patch,
                 "eval_script": eval_script,
                 "cwd": cwd,
-                "timeout": timeout,
+                "timeout": eval_timeout,
             },
             op_name="evaluate",
             http_max_retries=self.evaluate_max_retries,
             app_max_retries=self.evaluate_max_retries,
+            http_timeout=http_timeout,
+            use_slime=False,
         )
 
     async def close(self, lease_id: str) -> None:
@@ -269,6 +353,15 @@ class SweEnvClient:
             path="stats",
             payload={"lease_id": lease_id},
             op_name="stats",
+            http_max_retries=1,
+            app_max_retries=1,
+        )
+
+    async def stats_batch(self, lease_ids: list[str]) -> dict[str, Any]:
+        return await self._post_with_retry(
+            path="stats_batch",
+            payload={"lease_ids": lease_ids},
+            op_name="stats_batch",
             http_max_retries=1,
             app_max_retries=1,
         )
@@ -291,6 +384,7 @@ class SweEnvClient:
         policy: str = "",
         reason: str = "manual",
         parent_checkpoint_id: str | None = None,
+        fault_injection_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "lease_id": lease_id,
@@ -305,6 +399,8 @@ class SweEnvClient:
             payload["env"] = env
         if parent_checkpoint_id is not None:
             payload["parent_checkpoint_id"] = parent_checkpoint_id
+        if fault_injection_spec:
+            payload["fault_injection_spec"] = dict(fault_injection_spec)
         return await self._post_checkpoint_once(
             path="checkpoint/create",
             payload=payload,

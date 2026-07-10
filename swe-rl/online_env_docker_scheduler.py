@@ -10,6 +10,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib import request as urllib_request
 
 try:
     from loguru import logger
@@ -18,12 +19,19 @@ except Exception:  # pragma: no cover - fallback for lightweight test envs
 
     logger = logging.getLogger("swe.online_env_docker_scheduler")
 
-from slime.utils.http_utils import get
-
-
 GIB = 1024 ** 3
 _UNBOUNDED_RESOURCE_BYTES = 1 << 60
 _UNBOUNDED_CPU_PERCENT = 1e9
+
+
+def _get_json_blocking(url: str, timeout: float = 30.0) -> dict[str, Any]:
+    req = urllib_request.Request(url, method="GET")
+    with urllib_request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"GET {url} returned non-dict payload: {payload!r}")
+    return payload
 
 
 @dataclass(slots=True)
@@ -74,6 +82,8 @@ class PromptResourceSummary:
     started_at: float
     finished_at: float
     total_time_sec: float
+    cpu_sample_count: int = 0
+    lease_count: int = 0
 
 
 @dataclass(slots=True)
@@ -89,6 +99,7 @@ class SchedulerConfig:
     max_unknown_repo_concurrency: int = 128
     cold_start_memory_multiplier: float = 2.0
     cold_start_cpu_multiplier: float = 1.5
+    max_active_prompts: int = 0
     startup_max_active_prompts: int = 0
     startup_cap_duration_sec: float = 0.0
 
@@ -99,16 +110,18 @@ class SchedulerConfig:
 
     profile_json_path: str = ""
     resource_stats_dir: str = ""
-    resource_stats_refresh_sec: float = 30
+    resource_stats_refresh_sec: float = 60
     use_resource_stats_dir: bool = True
     disable_live_stats_polling: bool = False
     enable_live_profile_updates: bool = False
+    min_live_profile_samples: int = 2
+    min_profile_memory_bytes: float = 0.0
     max_stats_requests_per_round: int = 16
     stats_request_spacing_sec: float = 0.02
     use_realtime_server_memory: bool = True
     use_realtime_server_cpu: bool = True
     use_realtime_server_disk: bool = True
-    server_memory_refresh_sec: float = 10.0
+    server_memory_refresh_sec: float = 30.0
     verbose_logging: bool = True
     blocked_log_interval_sec: float = 5.0
     verbose_log_interval_sec: float = 10.0
@@ -119,6 +132,7 @@ class SchedulerConfig:
     realtime_local_active_discount: float = 0.7
     duration_priority_weight: float = 0.6
     duration_priority_ref_sec: float = 300.0
+    random_seed: int = 0
 
     @classmethod
     def from_env(cls) -> "SchedulerConfig":
@@ -151,6 +165,7 @@ class SchedulerConfig:
             max_unknown_repo_concurrency=int(os.getenv("SWE_SCHED_MAX_UNKNOWN_REPO_CONCURRENCY", "192")),
             cold_start_memory_multiplier=float(os.getenv("SWE_SCHED_COLD_START_MEMORY_MULTIPLIER", "2.0")),
             cold_start_cpu_multiplier=float(os.getenv("SWE_SCHED_COLD_START_CPU_MULTIPLIER", "1.5")),
+            max_active_prompts=int(os.getenv("SWE_SCHED_MAX_ACTIVE_PROMPTS", "0")),
             startup_max_active_prompts=int(os.getenv("SWE_SCHED_STARTUP_MAX_ACTIVE_PROMPTS", "0")),
             startup_cap_duration_sec=float(os.getenv("SWE_SCHED_STARTUP_CAP_DURATION_SEC", "0")),
             default_memory_bytes=default_memory_bytes,
@@ -163,6 +178,10 @@ class SchedulerConfig:
             use_resource_stats_dir=_env_flag("SWE_SCHED_USE_RESOURCE_STATS_DIR", True),
             disable_live_stats_polling=_env_flag("SWE_SCHED_DISABLE_LIVE_STATS_POLLING", False),
             enable_live_profile_updates=_env_flag("SWE_SCHED_ENABLE_LIVE_PROFILE_UPDATES", False),
+            min_live_profile_samples=int(os.getenv("SWE_SCHED_MIN_LIVE_PROFILE_SAMPLES", "2")),
+            min_profile_memory_bytes=float(
+                os.getenv("SWE_SCHED_MIN_PROFILE_MEMORY_BYTES", str(default_memory_bytes))
+            ),
             max_stats_requests_per_round=int(os.getenv("SWE_SCHED_MAX_STATS_REQUESTS_PER_ROUND", "16")),
             stats_request_spacing_sec=float(os.getenv("SWE_SCHED_STATS_REQUEST_SPACING_SEC", "0.02")),
             use_realtime_server_memory=_env_flag("SWE_SCHED_USE_REALTIME_SERVER_MEMORY", True),
@@ -176,13 +195,14 @@ class SchedulerConfig:
             head_block_requeue_threshold=int(os.getenv("SWE_SCHED_HEAD_BLOCK_REQUEUE_THRESHOLD", "100")),
             head_block_requeue_offset=int(os.getenv("SWE_SCHED_HEAD_BLOCK_REQUEUE_OFFSET", "1")),
             max_requests_per_resource_update=int(
-                os.getenv("SWE_SCHED_MAX_REQUESTS_PER_RESOURCE_UPDATE", "128")
+                os.getenv("SWE_SCHED_MAX_REQUESTS_PER_RESOURCE_UPDATE", "8")
             ),
             realtime_local_active_discount=float(
                 os.getenv("SWE_SCHED_REALTIME_LOCAL_ACTIVE_DISCOUNT", "0.7")
             ),
             duration_priority_weight=float(os.getenv("SWE_SCHED_DURATION_PRIORITY_WEIGHT", "0.4")),
             duration_priority_ref_sec=float(os.getenv("SWE_SCHED_DURATION_PRIORITY_REF_SEC", "300")),
+            random_seed=int(os.getenv("SWE_SCHED_RANDOM_SEED", os.getenv("SWE_REPLAY_SEED", "0"))),
         )
 
 
@@ -212,6 +232,16 @@ class _PendingPrompt:
 
 
 @dataclass(slots=True)
+class _LeaseResourceStats:
+    sample_count: int = 0
+    cpu_sample_count: int = 0
+    peak_memory_bytes: float = 0.0
+    avg_cpu_percent: float | None = None
+    disk_read_bytes: float = 0.0
+    disk_write_bytes: float = 0.0
+
+
+@dataclass(slots=True)
 class _ActivePrompt:
     prompt_id: str
     repo: str
@@ -221,7 +251,10 @@ class _ActivePrompt:
     has_history: bool
     started_at: float
     sample_count: int = 0
-    cpu_sum: float = 0.0
+    cpu_sample_count: int = 0
+    latest_cpu_percent: float | None = None
+    cpu_latest_by_lease: dict[str, float] = field(default_factory=dict)
+    lease_stats_by_lease: dict[str, _LeaseResourceStats] = field(default_factory=dict)
     peak_memory_bytes: float = 0.0
     disk_read_bytes: float = 0.0
     disk_write_bytes: float = 0.0
@@ -463,6 +496,7 @@ class OnlineEnvDockerScheduler:
         self._admitted_since_resource_refresh = 0
         self._last_stall_log_ts = 0.0
         self._last_server_resource_log_ts = 0.0
+        self._rng = random.Random(int(self.config.random_seed))
 
         self._profile_path = (
             Path(self.config.profile_json_path)
@@ -476,11 +510,14 @@ class OnlineEnvDockerScheduler:
             self._load_profiles()
         if self.config.verbose_logging:
             logger.info(
-                "[SWE-SCHED][VERBOSE] init enabled={} preserve_order={} live_stats_polling={} live_profile_updates={} stats_round_cap={} stats_spacing={}s realtime(mem={},cpu={},disk={}) refresh={}s blocked_log={}s verbose_log={}s",
+                "[SWE-SCHED][VERBOSE] init enabled={} preserve_order={} active_cap={} live_stats_polling={} live_profile_updates={} min_live_profile_samples={} min_profile_mem={} stats_round_cap={} stats_spacing={}s realtime(mem={},cpu={},disk={}) refresh={}s blocked_log={}s verbose_log={}s",
                 self.config.enabled,
                 self.config.preserve_prompt_order,
+                self.config.max_active_prompts,
                 not self.config.disable_live_stats_polling,
                 self.config.enable_live_profile_updates,
+                self.config.min_live_profile_samples,
+                format_bytes(self.config.min_profile_memory_bytes),
                 self.config.max_stats_requests_per_round,
                 self.config.stats_request_spacing_sec,
                 self.config.use_realtime_server_memory,
@@ -553,24 +590,34 @@ class OnlineEnvDockerScheduler:
                     self._cond.notify_all()
 
                 if request.admitted:
-                    self._active_prompts[prompt_id] = _ActivePrompt(
-                        prompt_id=prompt_id,
-                        repo=repo,
-                        data_key=data_key,
-                        rollout_id=rollout_id,
-                        predicted=predicted,
-                        has_history=has_history,
-                        started_at=time.time(),
-                    )
+                    active = self._active_prompts.get(prompt_id)
+                    if active is None:
+                        active = _ActivePrompt(
+                            prompt_id=prompt_id,
+                            repo=repo,
+                            data_key=data_key,
+                            rollout_id=rollout_id,
+                            predicted=request.predicted,
+                            has_history=request.has_history,
+                            started_at=time.time(),
+                        )
+                        self._active_prompts[prompt_id] = active
+                        logger.warning(
+                            "[SWE-SCHED] repaired missing active prompt record prompt={} repo={} rollout={}",
+                            prompt_id,
+                            repo,
+                            rollout_id,
+                        )
+                    admitted_predicted = active.predicted
                     logger.info(
                         "[SWE-SCHED] admitted prompt={} repo={} rollout={} predicted(mem={},cpu={:.1f}%,r={},w={}) active(mem={},cpu={:.1f}%)",
                         prompt_id,
                         repo,
                         rollout_id,
-                        format_bytes(predicted.memory_bytes),
-                        predicted.cpu_percent,
-                        format_bytes(predicted.disk_read_bytes),
-                        format_bytes(predicted.disk_write_bytes),
+                        format_bytes(admitted_predicted.memory_bytes),
+                        admitted_predicted.cpu_percent,
+                        format_bytes(admitted_predicted.disk_read_bytes),
+                        format_bytes(admitted_predicted.disk_write_bytes),
                         format_bytes(self._active_predicted.memory_bytes),
                         self._active_predicted.cpu_percent,
                     )
@@ -584,7 +631,7 @@ class OnlineEnvDockerScheduler:
                         prompt_id=prompt_id,
                         repo=repo,
                         rollout_id=rollout_id,
-                        predicted=predicted,
+                        predicted=admitted_predicted,
                     )
 
                 now = time.time()
@@ -670,11 +717,39 @@ class OnlineEnvDockerScheduler:
                 disk_read_bytes = active.predicted.disk_read_bytes
                 disk_write_bytes = active.predicted.disk_write_bytes
                 sample_count = 1
+                lease_count = 0
             else:
-                peak_memory_bytes = active.peak_memory_bytes
-                avg_cpu_percent = active.cpu_sum / active.sample_count
-                disk_read_bytes = active.disk_read_bytes
-                disk_write_bytes = active.disk_write_bytes
+                lease_stats = [
+                    item
+                    for item in active.lease_stats_by_lease.values()
+                    if item.sample_count > 0
+                ]
+                lease_count = len(lease_stats)
+                if lease_stats:
+                    peak_memory_bytes = sum(item.peak_memory_bytes for item in lease_stats) / len(lease_stats)
+                    disk_read_bytes = sum(item.disk_read_bytes for item in lease_stats) / len(lease_stats)
+                    disk_write_bytes = sum(item.disk_write_bytes for item in lease_stats) / len(lease_stats)
+                    cpu_values = [
+                        float(item.avg_cpu_percent)
+                        for item in lease_stats
+                        if item.cpu_sample_count > 0 and item.avg_cpu_percent is not None
+                    ]
+                    if cpu_values:
+                        avg_cpu_percent = sum(cpu_values) / len(cpu_values)
+                    elif active.latest_cpu_percent is not None:
+                        avg_cpu_percent = active.latest_cpu_percent
+                    else:
+                        avg_cpu_percent = active.predicted.cpu_percent
+                else:
+                    peak_memory_bytes = active.peak_memory_bytes
+                    if active.latest_cpu_percent is not None:
+                        avg_cpu_percent = active.latest_cpu_percent
+                    elif active.cpu_latest_by_lease:
+                        avg_cpu_percent = sum(active.cpu_latest_by_lease.values()) / len(active.cpu_latest_by_lease)
+                    else:
+                        avg_cpu_percent = active.predicted.cpu_percent
+                    disk_read_bytes = active.disk_read_bytes
+                    disk_write_bytes = active.disk_write_bytes
 
             finished_at = time.time()
             total_time_sec = max(0.0, finished_at - active.started_at)
@@ -690,16 +765,20 @@ class OnlineEnvDockerScheduler:
                 started_at=active.started_at,
                 finished_at=finished_at,
                 total_time_sec=total_time_sec,
+                cpu_sample_count=active.cpu_sample_count,
+                lease_count=lease_count,
             )
 
-            self._update_repo_profile_unlocked(summary)
-            self._refresh_pending_predictions_for_key_unlocked(active.data_key)
+            if self.config.enable_live_profile_updates:
+                self._update_repo_profile_unlocked(summary)
+                self._refresh_pending_predictions_for_key_unlocked(active.data_key)
             self._reset_admission_window_unlocked()
             self._cond.notify_all()
-            self._persist_profiles_unlocked()
+            if self.config.enable_live_profile_updates:
+                self._persist_profiles_unlocked()
 
             logger.info(
-                "[SWE-SCHED] prompt summary prompt={} repo={} peak_mem={} avg_cpu={:.2f}% disk(r={},w={}) elapsed={:.1f}s samples={}",
+                "[SWE-SCHED] prompt summary prompt={} repo={} peak_mem={} avg_cpu={:.2f}% disk(r={},w={}) elapsed={:.1f}s samples={} cpu_samples={} leases={}",
                 summary.prompt_id,
                 summary.repo,
                 format_bytes(summary.peak_memory_bytes),
@@ -708,6 +787,8 @@ class OnlineEnvDockerScheduler:
                 format_bytes(summary.disk_write_bytes),
                 summary.total_time_sec,
                 summary.sample_count,
+                summary.cpu_sample_count,
+                summary.lease_count,
             )
             return summary
 
@@ -825,17 +906,48 @@ class OnlineEnvDockerScheduler:
                 0.0,
             )
 
-        return (
-            ResourceVector(
-                memory_bytes=max(
-                    1.0,
-                    float(profile.peak_memory_bytes)
-                    * min(1.0, max(0.0, float(self.config.memory_peak_scale))),
-                ),
-                cpu_percent=max(0.1, float(profile.avg_cpu_percent)),
-                disk_read_bytes=max(1.0, float(profile.avg_disk_read_bytes)),
-                disk_write_bytes=max(1.0, float(profile.avg_disk_write_bytes)),
+        mem_mul = max(1.0, float(self.config.cold_start_memory_multiplier))
+        cpu_mul = max(1.0, float(self.config.cold_start_cpu_multiplier))
+        min_profile_memory = max(0.0, float(self.config.min_profile_memory_bytes))
+        profile_prediction = ResourceVector(
+            memory_bytes=max(
+                1.0,
+                min_profile_memory,
+                float(profile.peak_memory_bytes)
+                * min(1.0, max(0.0, float(self.config.memory_peak_scale))),
             ),
+            cpu_percent=max(0.1, float(profile.avg_cpu_percent)),
+            disk_read_bytes=max(1.0, float(profile.avg_disk_read_bytes)),
+            disk_write_bytes=max(1.0, float(profile.avg_disk_write_bytes)),
+        )
+
+        min_samples = max(0, int(self.config.min_live_profile_samples))
+        if profile.sample_count < min_samples:
+            return (
+                ResourceVector(
+                    memory_bytes=max(
+                        profile_prediction.memory_bytes,
+                        float(self.config.default_memory_bytes * mem_mul),
+                    ),
+                    cpu_percent=max(
+                        profile_prediction.cpu_percent,
+                        float(self.config.default_cpu_percent * cpu_mul),
+                    ),
+                    disk_read_bytes=max(
+                        profile_prediction.disk_read_bytes,
+                        float(self.config.default_disk_read_bytes),
+                    ),
+                    disk_write_bytes=max(
+                        profile_prediction.disk_write_bytes,
+                        float(self.config.default_disk_write_bytes),
+                    ),
+                ),
+                False,
+                max(0.0, float(profile.avg_total_time_sec)),
+            )
+
+        return (
+            profile_prediction,
             True,
             max(0.0, float(profile.avg_total_time_sec)),
         )
@@ -984,8 +1096,16 @@ class OnlineEnvDockerScheduler:
                 prev_disk_read_total = self._server_disk_read_total_bps
                 prev_disk_write_available = self._server_disk_write_available_bps
                 prev_disk_write_total = self._server_disk_write_total_bps
-                payload = await get(f"{base_url}/status")
-                pool = payload.get("pool", {}) if isinstance(payload, dict) else {}
+                status_fn = getattr(self.env_client, "status", None)
+                if callable(status_fn):
+                    payload = await status_fn()
+                else:
+                    payload = await asyncio.to_thread(_get_json_blocking, f"{base_url}/status", 30.0)
+                if not isinstance(payload, dict):
+                    raise RuntimeError(f"status returned non-dict payload: {payload!r}")
+                pool = payload.get("pool", {})
+                if not isinstance(pool, dict):
+                    raise RuntimeError(f"status payload missing dict pool field: {payload!r}")
                 if "cluster_memory_available_bytes" in pool:
                     self._server_memory_available_bytes = max(
                         0.0, float(pool.get("cluster_memory_available_bytes", 0.0) or 0.0)
@@ -1097,6 +1217,10 @@ class OnlineEnvDockerScheduler:
 
         request_cap = max(0, int(self.config.max_requests_per_resource_update))
         if request_cap > 0 and self._admitted_since_resource_refresh >= request_cap:
+            return None
+
+        active_cap = max(0, int(self.config.max_active_prompts))
+        if active_cap > 0 and len(self._active_prompts) >= active_cap:
             return None
 
         startup_cap = self._startup_active_cap_unlocked()
@@ -1254,9 +1378,20 @@ class OnlineEnvDockerScheduler:
         )
 
     def _mark_admitted(self, req: _PendingPrompt) -> None:
+        if req.admitted:
+            return
         req.admitted = True
         self._pending = [x for x in self._pending if x.prompt_id != req.prompt_id]
         self._active_predicted = self._active_predicted.plus(req.predicted)
+        self._active_prompts[req.prompt_id] = _ActivePrompt(
+            prompt_id=req.prompt_id,
+            repo=req.repo,
+            data_key=req.data_key,
+            rollout_id=req.rollout_id,
+            predicted=req.predicted,
+            has_history=req.has_history,
+            started_at=time.time(),
+        )
         self._admitted_since_resource_refresh += 1
 
     def _reset_admission_window_unlocked(self) -> None:
@@ -1302,8 +1437,8 @@ class OnlineEnvDockerScheduler:
         return (
             (fill_mem + fill_cpu + fill_r + fill_w)
             + 0.6 * dom
-            # + 0.4 * age_bonus
-            + duration_weight * duration_bonus
+            + 0.4 * age_bonus
+            # + duration_weight * duration_bonus
             # - unknown_penalty
         )
 
@@ -1314,6 +1449,10 @@ class OnlineEnvDockerScheduler:
                 "resource_refresh_request_cap "
                 f"{self._admitted_since_resource_refresh}>={request_cap}"
             )
+
+        active_cap = max(0, int(self.config.max_active_prompts))
+        if active_cap > 0 and len(self._active_prompts) >= active_cap:
+            return f"active_prompt_cap {len(self._active_prompts)}>={active_cap}"
 
         startup_cap = self._startup_active_cap_unlocked()
         if startup_cap > 0 and len(self._active_prompts) >= startup_cap:
@@ -1421,17 +1560,7 @@ class OnlineEnvDockerScheduler:
                 continue
 
             idle_rounds = 0
-            tasks: list[asyncio.Task] = []
-            for idx, (lease_id, prompt_id) in enumerate(leases):
-                tasks.append(
-                    asyncio.create_task(
-                        self._sample_one_lease(lease_id, prompt_id),
-                        name=f"swe-online-docker-sample-{idx}",
-                    )
-                )
-                if spacing > 0.0 and idx + 1 < len(leases):
-                    await asyncio.sleep(spacing)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._sample_leases(leases, spacing=spacing)
             await asyncio.sleep(interval)
 
         async with self._lock:
@@ -1452,7 +1581,7 @@ class OnlineEnvDockerScheduler:
             if rotate:
                 candidates = candidates[rotate:] + candidates[:rotate]
             head = candidates[: min(len(candidates), 4)]
-            random.shuffle(head)
+            self._rng.shuffle(head)
             candidates[: len(head)] = head
 
         limit = max(1, int(self.config.max_stats_requests_per_round))
@@ -1464,45 +1593,115 @@ class OnlineEnvDockerScheduler:
         self._sampling_cursor = (self._sampling_cursor + len(selected)) % len(candidates)
         return selected
 
+    async def _sample_leases(self, leases: list[tuple[str, str]], *, spacing: float = 0.0) -> None:
+        stats_batch = getattr(self.env_client, "stats_batch", None)
+        if callable(stats_batch) and leases:
+            try:
+                payload = await stats_batch([lease_id for lease_id, _ in leases])
+                stats_by_lease = payload.get("stats") if isinstance(payload, dict) else None
+                if not isinstance(stats_by_lease, dict):
+                    raise RuntimeError(f"invalid stats_batch payload: {payload!r}")
+                for lease_id, prompt_id in leases:
+                    item = stats_by_lease.get(lease_id)
+                    if not isinstance(item, dict):
+                        await self._record_lease_stats_error(
+                            lease_id,
+                            prompt_id,
+                            RuntimeError("missing lease stats in batch response"),
+                        )
+                        continue
+                    if not item.get("ok", False):
+                        await self._record_lease_stats_error(
+                            lease_id,
+                            prompt_id,
+                            RuntimeError(str(item.get("error") or item)),
+                        )
+                        continue
+                    await self._record_lease_stats_payload(lease_id, prompt_id, item)
+                return
+            except Exception as exc:
+                logger.debug(
+                    "[SWE-SCHED] batch stats failed for {} leases, falling back to per-lease stats: {}",
+                    len(leases),
+                    exc,
+                )
+
+        tasks: list[asyncio.Task] = []
+        for idx, (lease_id, prompt_id) in enumerate(leases):
+            tasks.append(
+                asyncio.create_task(
+                    self._sample_one_lease(lease_id, prompt_id),
+                    name=f"swe-online-docker-sample-{idx}",
+                )
+            )
+            if spacing > 0.0 and idx + 1 < len(leases):
+                await asyncio.sleep(spacing)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _sample_one_lease(self, lease_id: str, prompt_id: str) -> None:
         try:
             payload = await self.env_client.stats(lease_id=lease_id)
-            memory_bytes = float(payload.get("memory_usage_bytes", 0.0) or 0.0)
-            cpu_percent = float(payload.get("cpu_percent", 0.0) or 0.0)
-            disk_read_bytes = float(payload.get("disk_read_bytes", 0.0) or 0.0)
-            disk_write_bytes = float(payload.get("disk_write_bytes", 0.0) or 0.0)
         except Exception as exc:
-            error_text = str(exc).lower()
-            is_unknown_lease = "unknown lease_id" in error_text
-            async with self._lock:
-                active = self._active_prompts.get(prompt_id)
-                if active is None:
-                    return
-                failures = int(active.lease_errors.get(lease_id, 0)) + 1
-                active.lease_errors[lease_id] = failures
-                if is_unknown_lease or failures >= 3:
-                    active.leases.discard(lease_id)
-                    self._lease_to_prompt.pop(lease_id, None)
-                    if is_unknown_lease:
-                        logger.info(
-                            "[SWE-SCHED] lease={} no longer exists, stop tracking lease ({})",
-                            lease_id,
-                            exc,
-                        )
-                    else:
-                        logger.warning(
-                            "[SWE-SCHED] lease={} stats unavailable for 3 samples, stop tracking lease ({})",
-                            lease_id,
-                            exc,
-                        )
+            await self._record_lease_stats_error(lease_id, prompt_id, exc)
             return
+        await self._record_lease_stats_payload(lease_id, prompt_id, payload)
 
+    async def _record_lease_stats_error(self, lease_id: str, prompt_id: str, exc: Exception) -> None:
+        error_text = str(exc).lower()
+        is_unknown_lease = "unknown lease_id" in error_text
+        async with self._lock:
+            active = self._active_prompts.get(prompt_id)
+            if active is None:
+                return
+            failures = int(active.lease_errors.get(lease_id, 0)) + 1
+            active.lease_errors[lease_id] = failures
+            if is_unknown_lease or failures >= 3:
+                active.leases.discard(lease_id)
+                self._lease_to_prompt.pop(lease_id, None)
+                if is_unknown_lease:
+                    logger.info(
+                        "[SWE-SCHED] lease={} no longer exists, stop tracking lease ({})",
+                        lease_id,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "[SWE-SCHED] lease={} stats unavailable for 3 samples, stop tracking lease ({})",
+                        lease_id,
+                        exc,
+                    )
+
+    async def _record_lease_stats_payload(self, lease_id: str, prompt_id: str, payload: dict[str, Any]) -> None:
+        memory_bytes = float(
+            payload.get("peak_memory_usage_bytes", payload.get("memory_usage_bytes", 0.0)) or 0.0
+        )
+        cpu_percent = float(payload.get("avg_cpu_percent", payload.get("cpu_percent", 0.0)) or 0.0)
+        if "cpu_sample_valid" in payload:
+            cpu_sample_valid = bool(payload.get("cpu_sample_valid"))
+        else:
+            cpu_sample_valid = cpu_percent > 0.0
+        disk_read_bytes = float(
+            payload.get("peak_disk_read_bytes", payload.get("disk_read_bytes", 0.0)) or 0.0
+        )
+        disk_write_bytes = float(
+            payload.get("peak_disk_write_bytes", payload.get("disk_write_bytes", 0.0)) or 0.0
+        )
         async with self._lock:
             active = self._active_prompts.get(prompt_id)
             if active is None:
                 return
             active.sample_count += 1
-            active.cpu_sum += cpu_percent
+            lease_stats = active.lease_stats_by_lease.setdefault(lease_id, _LeaseResourceStats())
+            lease_stats.sample_count += 1
+            lease_stats.peak_memory_bytes = max(lease_stats.peak_memory_bytes, memory_bytes)
+            lease_stats.disk_read_bytes = max(lease_stats.disk_read_bytes, disk_read_bytes)
+            lease_stats.disk_write_bytes = max(lease_stats.disk_write_bytes, disk_write_bytes)
+            if cpu_sample_valid:
+                active.cpu_sample_count += 1
+                active.latest_cpu_percent = cpu_percent
+                active.cpu_latest_by_lease[lease_id] = cpu_percent
+                lease_stats.cpu_sample_count += 1
+                lease_stats.avg_cpu_percent = cpu_percent
             active.peak_memory_bytes = max(active.peak_memory_bytes, memory_bytes)
             active.disk_read_bytes = max(active.disk_read_bytes, disk_read_bytes)
             active.disk_write_bytes = max(active.disk_write_bytes, disk_write_bytes)

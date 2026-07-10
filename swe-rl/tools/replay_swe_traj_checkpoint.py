@@ -164,8 +164,18 @@ class ReplayEnvClient:
             app_max_retries=self.default_app_max_retries,
         )
 
-    async def exec(self, lease_id: str, command: str, cwd: str, timeout: int) -> dict[str, Any]:
+    async def exec(
+        self,
+        lease_id: str,
+        command: str,
+        cwd: str,
+        timeout: int,
+        *,
+        fault_injection_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = {"lease_id": lease_id, "command": command, "cwd": cwd, "timeout": timeout, "env": {}}
+        if fault_injection_spec:
+            payload["fault_injection_spec"] = dict(fault_injection_spec)
         last_result: dict[str, Any] | None = None
         for attempt in range(max(1, self.exec_paused_max_retries) + 1):
             out = await self._post_with_retry(
@@ -204,6 +214,7 @@ class ReplayEnvClient:
         policy: str,
         reason: str,
         parent_checkpoint_id: str | None,
+        fault_injection_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "lease_id": lease_id,
@@ -215,6 +226,8 @@ class ReplayEnvClient:
         }
         if parent_checkpoint_id is not None:
             payload["parent_checkpoint_id"] = parent_checkpoint_id
+        if fault_injection_spec:
+            payload["fault_injection_spec"] = dict(fault_injection_spec)
         return await self._post_with_retry(
             path="checkpoint/create",
             payload=payload,

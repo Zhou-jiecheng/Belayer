@@ -237,6 +237,126 @@ def _promote_latest_ready_checkpoint(
     )
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, int(len(ordered) * float(q)) - 1))
+    return ordered[idx]
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _annotate_checkpoint_overhead(
+    checkpoint_event: dict[str, Any],
+    *,
+    overlap_budget_sec: float,
+    overlap_source: str,
+) -> None:
+    elapsed_sec = float(checkpoint_event.get("create_call_elapsed_sec", 0.0) or 0.0)
+    overlap_budget = max(0.0, float(overlap_budget_sec or 0.0))
+    overlapped_sec = min(elapsed_sec, overlap_budget)
+    critical_path_sec = max(0.0, elapsed_sec - overlap_budget)
+    create_result = checkpoint_event.get("create_result") or {}
+    status_result = checkpoint_event.get("status_result") or {}
+    size_bytes = _int_or_zero(
+        create_result.get("size_bytes")
+        if isinstance(create_result, dict)
+        else None
+    )
+    if size_bytes <= 0 and isinstance(status_result, dict):
+        size_bytes = _int_or_zero(status_result.get("size_bytes"))
+    checkpoint_event.update(
+        {
+            "checkpoint_elapsed_sec": elapsed_sec,
+            "checkpoint_size_bytes": size_bytes,
+            "overlap_budget_sec": overlap_budget,
+            "overlap_source": overlap_source,
+            "overlapped_checkpoint_sec": overlapped_sec,
+            "critical_path_overhead_sec": critical_path_sec,
+        }
+    )
+
+
+def _successful_checkpoint_overhead_events(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for report in reports:
+        for event in report.get("checkpoint_events", []) or []:
+            if not isinstance(event, dict) or event.get("skipped", False):
+                continue
+            create_result = event.get("create_result") or {}
+            if not isinstance(create_result, dict) or not create_result.get("ok", False):
+                continue
+            events.append(event)
+    return events
+
+
+def _summarize_checkpoint_overhead_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    elapsed = [float(item.get("checkpoint_elapsed_sec", item.get("create_call_elapsed_sec", 0.0)) or 0.0) for item in events]
+    critical = [float(item.get("critical_path_overhead_sec", 0.0) or 0.0) for item in events]
+    overlapped = [float(item.get("overlapped_checkpoint_sec", 0.0) or 0.0) for item in events]
+    sizes = [_int_or_zero(item.get("checkpoint_size_bytes")) for item in events]
+    return {
+        "checkpoint_count": len(events),
+        "total_checkpoint_elapsed_sec": sum(elapsed),
+        "mean_checkpoint_elapsed_sec": mean(elapsed) if elapsed else 0.0,
+        "p50_checkpoint_elapsed_sec": median(elapsed) if elapsed else 0.0,
+        "p95_checkpoint_elapsed_sec": _percentile(elapsed, 0.95),
+        "total_critical_path_overhead_sec": sum(critical),
+        "mean_critical_path_overhead_sec": mean(critical) if critical else 0.0,
+        "p50_critical_path_overhead_sec": median(critical) if critical else 0.0,
+        "p95_critical_path_overhead_sec": _percentile(critical, 0.95),
+        "total_overlapped_checkpoint_sec": sum(overlapped),
+        "overlap_fraction": (sum(overlapped) / sum(elapsed)) if sum(elapsed) > 0.0 else 0.0,
+        "total_checkpoint_size_bytes": sum(sizes),
+        "mean_checkpoint_size_bytes": mean(sizes) if sizes else 0.0,
+        "p50_checkpoint_size_bytes": median(sizes) if sizes else 0.0,
+        "p95_checkpoint_size_bytes": _percentile([float(value) for value in sizes], 0.95),
+    }
+
+
+def _new_checkpoint_event(
+    checkpoint_events: list[dict[str, Any]],
+    before_len: int,
+) -> dict[str, Any] | None:
+    if len(checkpoint_events) <= before_len:
+        return None
+    event = checkpoint_events[-1]
+    return event if isinstance(event, dict) else None
+
+
+def _checkpoint_event_elapsed_sec(event: dict[str, Any] | None) -> float:
+    if not event:
+        return 0.0
+    try:
+        return max(
+            0.0,
+            float(event.get("checkpoint_elapsed_sec", event.get("create_call_elapsed_sec", 0.0)) or 0.0),
+        )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_llm_wait_credit(
+    event: dict[str, Any] | None,
+    *,
+    step_idx: int,
+    available_sec: float,
+) -> float:
+    elapsed_sec = _checkpoint_event_elapsed_sec(event)
+    credited_sec = min(max(0.0, available_sec), elapsed_sec)
+    if event is not None:
+        event["llm_wait_credit_step_idx"] = step_idx
+        event["llm_wait_credit_available_sec"] = max(0.0, available_sec)
+        event["llm_wait_credit_applied_sec"] = credited_sec
+    return credited_sec
+
+
 async def _attempt_checkpoint_create(
     *,
     env_client: ReplayEnvClient,
@@ -250,6 +370,8 @@ async def _attempt_checkpoint_create(
     parent_checkpoint_id: str | None,
     protected_env_cost_sec: float,
     protected_llm_cost_sec: float,
+    overlap_budget_sec: float = 0.0,
+    overlap_source: str = "none",
     report_fields: dict[str, Any] | None = None,
     traj_label: str | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
@@ -308,6 +430,11 @@ async def _attempt_checkpoint_create(
             "ready_at": create_result.get("ready_at", create_call_end_ts),
         }
         checkpoint_event["resolved_inline"] = True
+        _annotate_checkpoint_overhead(
+            checkpoint_event,
+            overlap_budget_sec=overlap_budget_sec,
+            overlap_source=overlap_source,
+        )
         checkpoint_events.append(checkpoint_event)
         if traj_label:
             logger.info(
@@ -323,6 +450,11 @@ async def _attempt_checkpoint_create(
     except Exception as exc:
         checkpoint_event["create_call_end_ts"] = time.time()
         checkpoint_event["create_call_elapsed_sec"] = time.perf_counter() - create_call_started_perf
+        _annotate_checkpoint_overhead(
+            checkpoint_event,
+            overlap_budget_sec=overlap_budget_sec,
+            overlap_source=overlap_source,
+        )
         if not _is_checkpoint_busy_error(exc):
             raise
         checkpoint_event["skipped"] = True
@@ -414,6 +546,7 @@ async def _run_one_trajectory(
     rerun_from_base = 0
     wall_t0 = time.time()
     attempt_idx = 0
+    llm_wait_credit_by_step: dict[int, float] = {}
 
     try:
         while current_step_idx < len(steps):
@@ -421,6 +554,10 @@ async def _run_one_trajectory(
             await env_client.heartbeat(lease_id)
             llm_delay = step.llm_elapsed if args.simulate_llm_delay else 0.0
             llm_skipped_for_adaptive_rerun = False
+            prepaid_llm_wait_sec = min(
+                llm_delay,
+                max(0.0, llm_wait_credit_by_step.pop(current_step_idx, 0.0)),
+            )
 
             redo_replay_cost_sec = _redo_replay_cost_sec(
                 cumulative_env_replay_cost_sec,
@@ -439,10 +576,10 @@ async def _run_one_trajectory(
                 if latest_ready_checkpoint_step < 0
                 else max(0, current_step_idx - latest_ready_checkpoint_step)
             )
-            waited_in_llm_sec = 0.0
+            waited_in_llm_sec = prepaid_llm_wait_sec
             adaptive_checkpoint_submitted = False
             probe_attempted_in_bubble = False
-            if llm_delay > 0:
+            if llm_delay > waited_in_llm_sec:
                 if (
                     policy == "adaptive-risk"
                     and tail_model is not None
@@ -519,6 +656,7 @@ async def _run_one_trajectory(
                                 "steps_since_latest_ready_checkpoint": steps_since_latest_ready_checkpoint,
                                 "conditional_tail_probability": conditional_tail_prob,
                             }
+                            checkpoint_event_count_before = len(report["checkpoint_events"])
                             create_result, busy = await _attempt_checkpoint_create(
                                 env_client=env_client,
                                 lease_id=lease_id,
@@ -531,8 +669,19 @@ async def _run_one_trajectory(
                                 parent_checkpoint_id=latest_ready_checkpoint_id,
                                 protected_env_cost_sec=cumulative_env_replay_cost_sec,
                                 protected_llm_cost_sec=cumulative_llm_replay_cost_sec,
+                                overlap_budget_sec=max(0.0, llm_delay - waited_in_llm_sec),
+                                overlap_source="current_llm_wait_remaining",
                                 report_fields=event_context,
                                 traj_label=traj_label,
+                            )
+                            checkpoint_event = _new_checkpoint_event(
+                                report["checkpoint_events"],
+                                checkpoint_event_count_before,
+                            )
+                            waited_in_llm_sec += _record_llm_wait_credit(
+                                checkpoint_event,
+                                step_idx=current_step_idx,
+                                available_sec=llm_delay - waited_in_llm_sec,
                             )
                             if create_result is not None:
                                 checkpoint_created += 1
@@ -571,7 +720,7 @@ async def _run_one_trajectory(
                             await asyncio.sleep(sleep_chunk)
                             waited_in_llm_sec += sleep_chunk
                 else:
-                    await asyncio.sleep(llm_delay)
+                    await asyncio.sleep(llm_delay - waited_in_llm_sec)
                     waited_in_llm_sec = llm_delay
 
             if current_step_idx in pending_injection_steps:
@@ -609,6 +758,7 @@ async def _run_one_trajectory(
                     report["rerun_events"].append(failure_event)
                     cumulative_env_replay_cost_sec = latest_ready_protected_env_cost_sec
                     cumulative_llm_replay_cost_sec = latest_ready_protected_llm_cost_sec
+                    llm_wait_credit_by_step.clear()
                     current_step_idx = latest_ready_resume_step_idx
                     continue
 
@@ -635,6 +785,7 @@ async def _run_one_trajectory(
                 latest_ready_protected_llm_cost_sec = 0.0
                 cumulative_env_replay_cost_sec = 0.0
                 cumulative_llm_replay_cost_sec = 0.0
+                llm_wait_credit_by_step.clear()
                 current_step_idx = 0
                 continue
 
@@ -649,6 +800,7 @@ async def _run_one_trajectory(
                     "actual_returncode": int(exec_result.get("returncode", -1)),
                     "simulated_llm_delay_sec": llm_delay,
                     "llm_waited_before_exec_sec": waited_in_llm_sec,
+                    "llm_wait_credit_applied_sec": prepaid_llm_wait_sec,
                     "attempt_idx": attempt_idx,
                     "is_rerun_attempt": attempt_idx > 0,
                     "llm_skipped_for_adaptive_rerun": llm_skipped_for_adaptive_rerun,
@@ -666,7 +818,13 @@ async def _run_one_trajectory(
                 raise ValueError(f"Unsupported policy: {policy}")
 
             if current_step_idx < len(steps) - 1 and should_attempt_checkpoint:
+                next_llm_overlap_budget_sec = (
+                    float(steps[current_step_idx + 1].llm_elapsed)
+                    if args.simulate_llm_delay
+                    else 0.0
+                )
                 checkpoint_attempts += 1
+                checkpoint_event_count_before = len(report["checkpoint_events"])
                 create_result, busy = await _attempt_checkpoint_create(
                     env_client=env_client,
                     lease_id=lease_id,
@@ -679,8 +837,23 @@ async def _run_one_trajectory(
                     parent_checkpoint_id=latest_ready_checkpoint_id,
                     protected_env_cost_sec=cumulative_env_replay_cost_sec,
                     protected_llm_cost_sec=cumulative_llm_replay_cost_sec,
+                    overlap_budget_sec=next_llm_overlap_budget_sec,
+                    overlap_source="next_llm_response",
                     traj_label=traj_label,
                 )
+                checkpoint_event = _new_checkpoint_event(
+                    report["checkpoint_events"],
+                    checkpoint_event_count_before,
+                )
+                credited_sec = _record_llm_wait_credit(
+                    checkpoint_event,
+                    step_idx=current_step_idx + 1,
+                    available_sec=next_llm_overlap_budget_sec,
+                )
+                if credited_sec > 0.0:
+                    llm_wait_credit_by_step[current_step_idx + 1] = (
+                        llm_wait_credit_by_step.get(current_step_idx + 1, 0.0) + credited_sec
+                    )
                 if create_result is not None:
                     checkpoint_created += 1
                     latest_ready_checkpoint_id, latest_ready_checkpoint_step, latest_ready_resume_step_idx, latest_ready_protected_env_cost_sec, latest_ready_protected_llm_cost_sec, promoted = _promote_latest_ready_checkpoint(
@@ -733,6 +906,14 @@ async def _run_one_trajectory(
         except Exception as exc:
             report["close_error"] = str(exc)
 
+    checkpoint_overhead_summary = _summarize_checkpoint_overhead_events(
+        _successful_checkpoint_overhead_events([report])
+    )
+    total_llm_wait_credit_applied_sec = sum(
+        float(event.get("llm_wait_credit_applied_sec", 0.0) or 0.0)
+        for event in report["checkpoint_events"]
+        if isinstance(event, dict)
+    )
     report["metrics"] = {
         "checkpoint_attempts": checkpoint_attempts,
         "checkpoint_created": checkpoint_created,
@@ -744,6 +925,8 @@ async def _run_one_trajectory(
         "fault_injections_triggered": len(report["failure_events"]),
         "fault_injections_remaining": len(pending_injection_steps),
         "wall_time_sec": time.time() - wall_t0,
+        "llm_wait_credit_applied_sec": total_llm_wait_credit_applied_sec,
+        "checkpoint_overhead": checkpoint_overhead_summary,
     }
     return report
 
@@ -815,9 +998,17 @@ async def _run_policy(
     total_rerun_ckpt = sum(int(item.get("metrics", {}).get("rerun_from_checkpoint", 0)) for item in reports if item.get("ok"))
     total_rerun_base = sum(int(item.get("metrics", {}).get("rerun_from_base", 0)) for item in reports if item.get("ok"))
     total_fault_injections = sum(int(item.get("metrics", {}).get("fault_injections_triggered", 0)) for item in reports if item.get("ok"))
+    total_llm_wait_credit = sum(
+        float(item.get("metrics", {}).get("llm_wait_credit_applied_sec", 0.0) or 0.0)
+        for item in reports
+        if item.get("ok")
+    )
     total_gc_deleted = int((batch_gc_result or {}).get("deleted_count", 0))
     total_gc_reclaimed = int((batch_gc_result or {}).get("reclaimed_bytes", 0))
     planned_injection_count = sum(len(item.inject_before_step_indices) for item in injections.values())
+    checkpoint_overhead = _summarize_checkpoint_overhead_events(
+        _successful_checkpoint_overhead_events([item for item in reports if item.get("ok")])
+    )
 
     summary = {
         "policy": policy,
@@ -841,6 +1032,12 @@ async def _run_policy(
         "gc_deleted_count": total_gc_deleted,
         "gc_reclaimed_bytes": total_gc_reclaimed,
         "injection_trajectory_count": len(injections),
+        "checkpoint_overhead": checkpoint_overhead,
+        "checkpoint_total_elapsed_sec": checkpoint_overhead["total_checkpoint_elapsed_sec"],
+        "checkpoint_total_critical_path_overhead_sec": checkpoint_overhead["total_critical_path_overhead_sec"],
+        "checkpoint_total_overlapped_sec": checkpoint_overhead["total_overlapped_checkpoint_sec"],
+        "checkpoint_total_size_bytes": checkpoint_overhead["total_checkpoint_size_bytes"],
+        "llm_wait_credit_applied_sec": total_llm_wait_credit,
     }
     summary_path = out_dir / "summary.json"
     summary_path.write_text(
@@ -886,7 +1083,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only run global checkpoint GC when total checkpoint/list count reaches at least this many checkpoints. Set 0 to always GC.",
     )
     parser.add_argument("--gc-dry-run", action="store_true")
-    parser.add_argument("--gc-drain-timeout-sec", type=float, default=600.0)
+    parser.add_argument("--gc-drain-timeout-sec", type=float, default=1800.0)
     parser.add_argument("--gc-drain-poll-interval-sec", type=float, default=0.1)
     parser.add_argument("--adaptive-failure-prob", type=float, default=0.01)
     parser.add_argument("--adaptive-tail-root", default=str(DEFAULT_ADAPTIVE_TAIL_ROOT))

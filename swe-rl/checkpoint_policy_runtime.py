@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover
 
 POLICIES = ("oracle-no-fault-no-checkpoint", "never", "always", "adaptive-risk", "every-3")
 DEFAULT_ADAPTIVE_TAIL_ROOT = Path(__file__).resolve().parents[1] / "export" / "swe_rollouts_profile_20260325_083236"
-DEFAULT_ADAPTIVE_BUDGET_SEC = 7.0
+DEFAULT_ADAPTIVE_BUDGET_SEC = 13.0
 DEFAULT_ADAPTIVE_DECISION_INTERVAL_SEC = 1.0
 DEFAULT_ADAPTIVE_FAILURE_PROB = 0.003
 DEFAULT_ADAPTIVE_MIN_DELTA_ENV_COST_SEC = 0.1

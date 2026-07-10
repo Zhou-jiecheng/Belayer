@@ -140,6 +140,47 @@ class TestSweEnvClientRetry(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_checkpoint_create_payload_with_fault_injection_spec(self):
+        seen: list[tuple[str, dict]] = []
+
+        async def fake_post(url, payload, max_retries=60):
+            seen.append((url, payload))
+            return {"ok": True, "checkpoint_id": "ckpt-1"}
+
+        client = SweEnvClient(base_url="http://fake")
+        with patch("swe_env_client.post", new=fake_post):
+            out = await client.checkpoint_create(
+                "lease-1",
+                fault_injection_spec={"phase": "before_commit", "delay_sec": 0.25},
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(
+            seen[0][1]["fault_injection_spec"],
+            {"phase": "before_commit", "delay_sec": 0.25},
+        )
+
+    async def test_exec_payload_with_fault_injection_spec(self):
+        seen: list[tuple[str, dict]] = []
+
+        async def fake_post(url, payload, max_retries=60):
+            seen.append((url, payload))
+            return {"ok": True, "returncode": -1}
+
+        client = SweEnvClient(base_url="http://fake")
+        with patch("swe_env_client.post", new=fake_post):
+            out = await client.exec(
+                "lease-1",
+                "sleep 1",
+                fault_injection_spec={"phase": "mid_action", "delay_sec": 0.0},
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(
+            seen[0][1]["fault_injection_spec"],
+            {"phase": "mid_action", "delay_sec": 0.0},
+        )
+
     async def test_checkpoint_probe_does_not_retry_busy_payload(self):
         attempts = {"n": 0}
 

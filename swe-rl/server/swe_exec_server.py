@@ -61,10 +61,54 @@ _cpu_prev_ts: float | None = None
 _disk_prev_read_bytes: int | None = None
 _disk_prev_write_bytes: int | None = None
 _disk_prev_ts: float | None = None
+_stats_cache: dict[str, dict[str, Any]] = {}
+_stats_cache_lock = threading.RLock()
+_stats_sampler_lock = threading.Lock()
+_stats_sampler_thread: threading.Thread | None = None
+_stats_sampler_stop = threading.Event()
+_action_stats_sampler_lock = threading.Lock()
+_action_stats_sampler_thread: threading.Thread | None = None
+_action_stats_wakeup = threading.Event()
+_action_stats_containers: defaultdict[str, int] = defaultdict(int)
+_cgroup_cache_lock = threading.RLock()
+_cgroup_path_cache: dict[str, str] = {}
+_cgroup_cpu_prev: dict[str, tuple[int, float]] = {}
+try:
+    _PROC_CLK_TCK = max(1, int(os.sysconf("SC_CLK_TCK")))
+except Exception:
+    _PROC_CLK_TCK = 100
+
+_CGROUP_MEMORY_ROOTS = [
+    Path("/sys/fs/cgroup/memory"),
+    Path("/sys/fs/cgroup/unified"),
+    Path("/sys/fs/cgroup"),
+]
+_CGROUP_CPU_ROOTS = [
+    Path("/sys/fs/cgroup/cpu,cpuacct"),
+    Path("/sys/fs/cgroup/cpuacct"),
+    Path("/sys/fs/cgroup/cpu"),
+    Path("/sys/fs/cgroup/unified"),
+    Path("/sys/fs/cgroup"),
+]
+_CGROUP_IO_ROOTS = [
+    Path("/sys/fs/cgroup/blkio"),
+    Path("/sys/fs/cgroup/unified"),
+    Path("/sys/fs/cgroup"),
+]
+_CPU_SAMPLE_MIN_ELAPSED_SEC = max(
+    0.0,
+    float(os.getenv("SWE_EXEC_STATS_CPU_SAMPLE_MIN_ELAPSED_SEC", "0.5")),
+)
+_CPU_SAMPLE_MAX_PERCENT = max(
+    1.0,
+    float(os.getenv("SWE_EXEC_STATS_MAX_CONTAINER_CPU_PERCENT", "1000.0")),
+)
 
 _RUNTIME_STATE_SCHEMA_VERSION = 1
 _RUNTIME_STATE_BASE_DIR = "/tmp/swe-runtime-checkpoints"
 _RUNTIME_ENV_WHITELIST = ("PATH", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX")
+_EXEC_FAULT_PHASES = frozenset({"before_action", "mid_action"})
+_CHECKPOINT_FAULT_PHASES = frozenset({"before_commit", "after_commit_before_ready"})
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -90,6 +134,7 @@ class _CheckpointCreateJob:
     checkpoint_image: str
     record: dict[str, Any]
     runtime_env: dict[str, str]
+    fault_injection_spec: dict[str, Any] | None
     done_event: threading.Event
     enqueued_perf: float
     worker_started_perf: float | None = None
@@ -219,6 +264,143 @@ def _build_runtime_state_payload(record: dict[str, Any], runtime_env: dict[str, 
             ),
         },
     }
+
+
+def _normalize_fault_injection_spec(
+    raw: dict[str, Any] | None,
+    *,
+    allowed_phases: set[str] | frozenset[str],
+) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("fault_injection_spec must be a JSON object")
+    phase = str(raw.get("phase", "") or "").strip()
+    if not phase:
+        raise ValueError("fault_injection_spec.phase is required")
+    if phase not in allowed_phases:
+        allowed = ", ".join(sorted(allowed_phases))
+        raise ValueError(f"unsupported fault injection phase: {phase} (allowed: {allowed})")
+    try:
+        delay_sec = max(0.0, float(raw.get("delay_sec", 0.0) or 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fault_injection_spec.delay_sec must be numeric") from exc
+    tag = str(raw.get("tag", "") or "").strip()
+    return {
+        "phase": phase,
+        "delay_sec": delay_sec,
+        "tag": tag,
+    }
+
+
+def _build_fault_event(
+    *,
+    container_id: str,
+    fault_type: str,
+    fault_phase: str,
+    delay_sec: float = 0.0,
+    tag: str = "",
+) -> dict[str, Any]:
+    event = {
+        "fault_injected": True,
+        "fault_type": fault_type,
+        "fault_phase": fault_phase,
+        "error_code": "fault_injected_container_killed",
+        "container_usable": False,
+        "container_id": str(container_id),
+    }
+    if delay_sec > 0.0:
+        event["fault_delay_sec"] = float(delay_sec)
+    if tag:
+        event["fault_tag"] = tag
+    return event
+
+
+def _mark_container_faulted(container_id: str, *, fault_type: str) -> dict[str, Any] | None:
+    with _lock:
+        active_info = _active_containers.get(str(container_id))
+        if active_info is not None:
+            active_info["faulted"] = True
+            active_info["fault_injected_at"] = time.time()
+            active_info["last_fault_type"] = fault_type
+            return dict(active_info)
+    return None
+
+
+def _release_container_for_fault(
+    container_id: str,
+    *,
+    active_info: dict[str, Any] | None,
+    remove_tracking: bool,
+    drop_gate: bool,
+) -> dict[str, Any]:
+    outcome: dict[str, Any] = {}
+    try:
+        # Fault injection must interrupt foreground docker operations instead of
+        # queueing behind them; otherwise a "random" fail-stop only fires after
+        # exec/commit finishes, which does not validate in-flight recovery.
+        if active_info is None:
+            _docker_destroy_container(str(container_id), timeout=30)
+            outcome["destroyed"] = True
+            outcome["destroy_reason"] = "inactive_faulted_container"
+        else:
+            release = _CONTAINER_POOL.release(
+                container_id=str(container_id),
+                image=str(active_info.get("image", "")),
+                name=str(active_info.get("name", "")),
+                cwd=str(active_info.get("cwd", _SERVER_CONFIG.pool_default_cwd)),
+            )
+            outcome["destroyed"] = bool(release.get("destroyed", False))
+            outcome["destroy_reason"] = str(release.get("reason", "fault_injected_fail_stop"))
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        outcome["destroyed"] = False
+        outcome["destroy_error"] = str(exc)
+    if remove_tracking:
+        with _lock:
+            _active_containers.pop(str(container_id), None)
+    if drop_gate:
+        _drop_container_op_gate(str(container_id))
+    return outcome
+
+
+def _inject_fail_stop_fault(
+    container_id: str,
+    *,
+    fault_type: str,
+    fault_phase: str,
+    delay_sec: float = 0.0,
+    tag: str = "",
+    remove_tracking: bool,
+    drop_gate: bool,
+) -> dict[str, Any]:
+    active_info = _mark_container_faulted(
+        str(container_id),
+        fault_type=fault_type,
+    )
+    event = _build_fault_event(
+        container_id=str(container_id),
+        fault_type=fault_type,
+        fault_phase=fault_phase,
+        delay_sec=delay_sec,
+        tag=tag,
+    )
+    event.update(
+        _release_container_for_fault(
+            str(container_id),
+            active_info=active_info,
+            remove_tracking=remove_tracking,
+            drop_gate=drop_gate,
+        )
+    )
+    logger.warning(
+        "Injected explicit fault into container %s phase=%s type=%s destroyed=%s reason=%s",
+        str(container_id)[:12],
+        fault_phase,
+        fault_type,
+        event.get("destroyed", False),
+        event.get("destroy_reason", ""),
+    )
+    return event
 
 
 def _capture_runtime_state(container_id: str, checkpoint_id: str, payload: dict[str, Any]) -> None:
@@ -392,12 +574,22 @@ class ExecServerConfig:
     pool_resource_stats_dir: str = ""
     checkpoint_enabled: bool = True
     checkpoint_dir: str = "/tmp/swe-checkpoints"
-    checkpoint_create_timeout_sec: int = 6
+    checkpoint_create_timeout_sec: int = 15
     checkpoint_timeout_cooldown_sec: float = 60.0
     checkpoint_min_ready_latency_sec: float = 2.0
-    checkpoint_max_inflight: int = 8
+    checkpoint_max_inflight: int = 12
     checkpoint_probe_inspect_timeout_sec: float = 0.3
     exec_fault_injection_default_probability: float = 0.003
+    stats_sampler_enabled: bool = True
+    stats_backend: str = "cgroup"
+    stats_sampler_interval_sec: float = 1.0
+    stats_cache_ttl_sec: float = 5.0
+    stats_command_timeout_sec: int = 20
+    stats_batch_max_containers: int = 256
+    action_stats_sampler_enabled: bool = True
+    action_stats_interval_sec: float = 0.5
+    action_stats_command_timeout_sec: int = 5
+    action_stats_batch_max_containers: int = 64
     config_path: str = ""
 
     @classmethod
@@ -511,6 +703,54 @@ class ExecServerConfig:
                 "SWE_EXEC_FAULT_INJECTION_DEFAULT_PROBABILITY",
                 "exec_fault_injection_default_probability",
                 cls.exec_fault_injection_default_probability,
+            ),
+            stats_sampler_enabled=_env_flag(
+                "SWE_EXEC_STATS_SAMPLER_ENABLE",
+                bool(raw.get("stats_sampler_enabled", cls.stats_sampler_enabled)),
+            ),
+            stats_backend=_read_str(
+                "SWE_EXEC_STATS_BACKEND",
+                "stats_backend",
+                cls.stats_backend,
+            ),
+            stats_sampler_interval_sec=_read_float(
+                "SWE_EXEC_STATS_SAMPLER_INTERVAL_SEC",
+                "stats_sampler_interval_sec",
+                cls.stats_sampler_interval_sec,
+            ),
+            stats_cache_ttl_sec=_read_float(
+                "SWE_EXEC_STATS_CACHE_TTL_SEC",
+                "stats_cache_ttl_sec",
+                cls.stats_cache_ttl_sec,
+            ),
+            stats_command_timeout_sec=_read_int(
+                "SWE_EXEC_STATS_COMMAND_TIMEOUT_SEC",
+                "stats_command_timeout_sec",
+                cls.stats_command_timeout_sec,
+            ),
+            stats_batch_max_containers=_read_int(
+                "SWE_EXEC_STATS_BATCH_MAX_CONTAINERS",
+                "stats_batch_max_containers",
+                cls.stats_batch_max_containers,
+            ),
+            action_stats_sampler_enabled=_env_flag(
+                "SWE_EXEC_ACTION_STATS_SAMPLER_ENABLE",
+                bool(raw.get("action_stats_sampler_enabled", cls.action_stats_sampler_enabled)),
+            ),
+            action_stats_interval_sec=_read_float(
+                "SWE_EXEC_ACTION_STATS_INTERVAL_SEC",
+                "action_stats_interval_sec",
+                cls.action_stats_interval_sec,
+            ),
+            action_stats_command_timeout_sec=_read_int(
+                "SWE_EXEC_ACTION_STATS_COMMAND_TIMEOUT_SEC",
+                "action_stats_command_timeout_sec",
+                cls.action_stats_command_timeout_sec,
+            ),
+            action_stats_batch_max_containers=_read_int(
+                "SWE_EXEC_ACTION_STATS_BATCH_MAX_CONTAINERS",
+                "action_stats_batch_max_containers",
+                cls.action_stats_batch_max_containers,
             ),
             config_path=str(config_path),
         )
@@ -1010,6 +1250,744 @@ def _parse_percent(text: str) -> float:
         return float(cleaned)
     except Exception:
         return 0.0
+
+
+def _parse_docker_stats_payload(payload: dict[str, Any], *, include_raw: bool = False) -> dict[str, Any]:
+    mem_usage = (payload.get("MemUsage") or "0B / 0B").split("/", 1)[0].strip()
+    cpu_percent = _parse_percent(payload.get("CPUPerc", "0%"))
+    block_io = payload.get("BlockIO") or "0B / 0B"
+    if "/" in block_io:
+        read_txt, write_txt = [x.strip() for x in block_io.split("/", 1)]
+    else:
+        read_txt, write_txt = block_io.strip(), "0B"
+
+    out = {
+        "ok": True,
+        "memory_usage_bytes": _parse_size_to_bytes(mem_usage),
+        "cpu_percent": cpu_percent,
+        "avg_cpu_percent": cpu_percent,
+        "cpu_sample_valid": True,
+        "cpu_sample_elapsed_sec": 1.0,
+        "cpu_source": "docker_stats",
+        "disk_read_bytes": _parse_size_to_bytes(read_txt),
+        "disk_write_bytes": _parse_size_to_bytes(write_txt),
+        "ts": time.time(),
+    }
+    if include_raw:
+        out["raw"] = payload
+    return out
+
+
+def _match_stats_container_id(reported: str, requested: list[str], used: set[str]) -> str | None:
+    key = str(reported or "").strip()
+    if not key:
+        return None
+    for container_id in requested:
+        if container_id in used:
+            continue
+        if container_id == key or container_id.startswith(key) or key.startswith(container_id):
+            return container_id
+    return None
+
+
+def _docker_stats_for_containers(
+    container_ids: list[str],
+    *,
+    timeout: int,
+    include_raw: bool = False,
+) -> dict[str, dict[str, Any]]:
+    requested = [str(cid).strip() for cid in container_ids if str(cid).strip()]
+    if not requested:
+        return {}
+    r = _docker("stats", "--no-stream", "--format", "{{json .}}", *requested, timeout=timeout)
+    if r.returncode != 0:
+        if len(requested) <= 1:
+            raise RuntimeError(r.stderr.strip() or "docker stats failed")
+        out: dict[str, dict[str, Any]] = {}
+        for container_id in requested:
+            try:
+                out.update(
+                    _docker_stats_for_containers(
+                        [container_id],
+                        timeout=timeout,
+                        include_raw=include_raw,
+                    )
+                )
+            except Exception as exc:
+                out[container_id] = {
+                    "ok": False,
+                    "error": str(exc),
+                    "container_id": container_id,
+                    "ts": time.time(),
+                }
+        return out
+
+    lines = [line for line in r.stdout.strip().splitlines() if line.strip()]
+    out: dict[str, dict[str, Any]] = {}
+    used: set[str] = set()
+    pending_payloads: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except Exception as exc:
+            logger.warning("Failed to parse docker stats json line: %s", exc)
+            continue
+        reported = payload.get("Container") or payload.get("ID") or payload.get("Name")
+        container_id = _match_stats_container_id(str(reported or ""), requested, used)
+        if container_id is None:
+            pending_payloads.append(payload)
+            continue
+        out[container_id] = _parse_docker_stats_payload(payload, include_raw=include_raw)
+        used.add(container_id)
+
+    remaining = [cid for cid in requested if cid not in used]
+    for container_id, payload in zip(remaining, pending_payloads):
+        out[container_id] = _parse_docker_stats_payload(payload, include_raw=include_raw)
+        used.add(container_id)
+    return out
+
+
+def _read_int_file(path: Path) -> int:
+    return int(path.read_text(encoding="utf-8").strip())
+
+
+def _first_existing_file(directory: Path, names: list[str]) -> Path | None:
+    for name in names:
+        path = directory / name
+        if path.exists():
+            return path
+    return None
+
+
+def _find_related_cgroup_file(
+    anchor_path: Path,
+    *,
+    anchor_roots: list[Path],
+    target_roots: list[Path],
+    names: list[str],
+) -> Path | None:
+    anchor_dir = anchor_path.parent
+    direct = _first_existing_file(anchor_dir, names)
+    if direct is not None:
+        return direct
+
+    seen: set[Path] = set()
+    for anchor_root in anchor_roots:
+        try:
+            relative = anchor_dir.relative_to(anchor_root)
+        except ValueError:
+            continue
+        for target_root in target_roots:
+            candidate_dir = target_root / relative
+            if candidate_dir in seen:
+                continue
+            seen.add(candidate_dir)
+            found = _first_existing_file(candidate_dir, names)
+            if found is not None:
+                return found
+    return None
+
+
+def _candidate_cgroup_dirs(root: Path, container_id: str) -> list[Path]:
+    short_id = container_id[:12]
+    names = [
+        container_id,
+        short_id,
+        f"docker-{container_id}.scope",
+        f"docker-{short_id}.scope",
+    ]
+    parents = ["", "docker", "system.slice", "machine.slice"]
+    candidates: list[Path] = []
+    for parent in parents:
+        base = root / parent if parent else root
+        for name in names:
+            candidates.append(base / name)
+    return candidates
+
+
+def _find_cgroup_file(container_id: str, *, cache_kind: str, roots: list[Path], names: list[str]) -> Path | None:
+    cache_key = f"{cache_kind}:{container_id}"
+    with _cgroup_cache_lock:
+        cached = _cgroup_path_cache.get(cache_key)
+    if cached:
+        cached_path = Path(cached)
+        if cached_path.exists():
+            return cached_path
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for directory in _candidate_cgroup_dirs(root, container_id):
+            for name in names:
+                path = directory / name
+                if path.exists():
+                    with _cgroup_cache_lock:
+                        _cgroup_path_cache[cache_key] = str(path)
+                    return path
+
+    short_id = container_id[:12]
+    for root in roots:
+        if not root.exists():
+            continue
+        root_depth = len(root.parts)
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                depth = len(Path(dirpath).parts) - root_depth
+                if depth > 6:
+                    dirnames[:] = []
+                    continue
+                if container_id not in dirpath and short_id not in dirpath:
+                    continue
+                for name in names:
+                    if name in filenames:
+                        path = Path(dirpath) / name
+                        with _cgroup_cache_lock:
+                            _cgroup_path_cache[cache_key] = str(path)
+                        return path
+        except OSError:
+            continue
+    return None
+
+
+def _read_cgroup_cpu_usage_ns(path: Path) -> int:
+    if path.name == "cpu.stat":
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "usage_usec":
+                return int(parts[1]) * 1000
+        raise ValueError(f"{path} does not expose usage_usec")
+    return _read_int_file(path)
+
+
+def _read_proc_stat_cpu_ticks(pid: int) -> int | None:
+    try:
+        text = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    end = text.rfind(")")
+    if end < 0:
+        return None
+    fields = text[end + 2 :].split()
+    if len(fields) <= 12:
+        return None
+    try:
+        return int(fields[11]) + int(fields[12])
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_proc_cpu_usage_ns(cgroup_dir: Path) -> int | None:
+    pids: set[int] = set()
+    root_depth = len(cgroup_dir.parts)
+    try:
+        walker = os.walk(cgroup_dir)
+        for dirpath, dirnames, filenames in walker:
+            depth = len(Path(dirpath).parts) - root_depth
+            if depth > 4:
+                dirnames[:] = []
+                continue
+            for name in ("tasks", "cgroup.procs"):
+                if name not in filenames:
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            pids.add(int(line))
+                        except ValueError:
+                            continue
+                except OSError:
+                    continue
+    except OSError:
+        return None
+
+    if not pids:
+        return None
+
+    ticks = 0
+    any_read = False
+    for pid in pids:
+        value = _read_proc_stat_cpu_ticks(pid)
+        if value is None:
+            continue
+        any_read = True
+        ticks += value
+    if not any_read:
+        return None
+    return int(ticks * 1_000_000_000 / _PROC_CLK_TCK)
+
+
+def _cpu_percent_from_usage(
+    container_id: str,
+    *,
+    source: str,
+    usage_ns: int,
+    now: float,
+) -> tuple[float, bool, float]:
+    prev_key = f"{source}:{container_id}"
+    with _cgroup_cache_lock:
+        prev = _cgroup_cpu_prev.get(prev_key)
+        if prev is None:
+            _cgroup_cpu_prev[prev_key] = (usage_ns, now)
+            return 0.0, False, 0.0
+        prev_usage_ns, prev_ts = prev
+        elapsed = max(1e-6, now - prev_ts)
+        if elapsed < _CPU_SAMPLE_MIN_ELAPSED_SEC:
+            return 0.0, False, elapsed
+        _cgroup_cpu_prev[prev_key] = (usage_ns, now)
+
+    delta_ns = usage_ns - prev_usage_ns
+    if delta_ns <= 0:
+        return 0.0, False, elapsed
+    cpu_percent = max(0.0, delta_ns / elapsed / 1e9 * 100.0)
+    if cpu_percent > _CPU_SAMPLE_MAX_PERCENT:
+        logger.debug(
+            "Ignoring implausible container CPU sample container=%s source=%s cpu=%.2f%% elapsed=%.3fs",
+            container_id[:12],
+            source,
+            cpu_percent,
+            elapsed,
+        )
+        return 0.0, False, elapsed
+    return cpu_percent, True, elapsed
+
+
+def _read_cgroup_io_bytes(path: Path) -> tuple[int, int]:
+    read_bytes = 0
+    write_bytes = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if path.name == "io.stat":
+            for item in parts[1:]:
+                key, sep, value = item.partition("=")
+                if not sep:
+                    continue
+                if key == "rbytes":
+                    read_bytes += int(value)
+                elif key == "wbytes":
+                    write_bytes += int(value)
+        elif len(parts) >= 3:
+            op = parts[-2].lower()
+            value = int(parts[-1])
+            if op == "read":
+                read_bytes += value
+            elif op == "write":
+                write_bytes += value
+    return read_bytes, write_bytes
+
+
+def _cgroup_stats_for_container(container_id: str, *, include_raw: bool = False) -> dict[str, Any]:
+    container_id = str(container_id).strip()
+    now = time.time()
+    memory_path = _find_cgroup_file(
+        container_id,
+        cache_kind="memory",
+        roots=_CGROUP_MEMORY_ROOTS,
+        names=["memory.current", "memory.usage_in_bytes"],
+    )
+    if memory_path is None:
+        return {
+            "ok": False,
+            "error": "cgroup memory file not found",
+            "container_id": container_id,
+            "ts": now,
+            "stats_backend": "cgroup",
+        }
+
+    cpu_path = _find_related_cgroup_file(
+        memory_path,
+        anchor_roots=_CGROUP_MEMORY_ROOTS,
+        target_roots=_CGROUP_CPU_ROOTS,
+        names=["cpuacct.usage", "cpu.stat"],
+    )
+    if cpu_path is None:
+        cpu_path = _find_cgroup_file(
+            container_id,
+            cache_kind="cpu",
+            roots=_CGROUP_CPU_ROOTS,
+            names=["cpuacct.usage", "cpu.stat"],
+        )
+    io_path = _find_related_cgroup_file(
+        memory_path,
+        anchor_roots=_CGROUP_MEMORY_ROOTS,
+        target_roots=_CGROUP_IO_ROOTS,
+        names=["io.stat", "blkio.throttle.io_service_bytes_recursive", "blkio.throttle.io_service_bytes"],
+    )
+    if io_path is None:
+        io_path = _find_cgroup_file(
+            container_id,
+            cache_kind="io",
+            roots=_CGROUP_IO_ROOTS,
+            names=["io.stat", "blkio.throttle.io_service_bytes_recursive", "blkio.throttle.io_service_bytes"],
+        )
+
+    memory_bytes = _read_int_file(memory_path)
+    cpu_percent = 0.0
+    cpu_sample_valid = False
+    cpu_sample_elapsed_sec = 0.0
+    cpu_source = ""
+    if cpu_path is not None:
+        try:
+            usage_ns = _read_cgroup_cpu_usage_ns(cpu_path)
+            cpu_source = f"cgroup:{cpu_path.name}"
+            cpu_percent, cpu_sample_valid, cpu_sample_elapsed_sec = _cpu_percent_from_usage(
+                container_id,
+                source=cpu_source,
+                usage_ns=usage_ns,
+                now=now,
+            )
+        except Exception:
+            cpu_source = ""
+
+    if not cpu_sample_valid:
+        proc_usage_ns = _read_proc_cpu_usage_ns(memory_path.parent)
+        if proc_usage_ns is not None:
+            proc_cpu_percent, proc_valid, proc_elapsed = _cpu_percent_from_usage(
+                container_id,
+                source="procfs",
+                usage_ns=proc_usage_ns,
+                now=now,
+            )
+            if proc_valid or not cpu_source:
+                cpu_percent = proc_cpu_percent
+                cpu_sample_valid = proc_valid
+                cpu_sample_elapsed_sec = proc_elapsed
+                cpu_source = "procfs"
+
+    disk_read_bytes = 0
+    disk_write_bytes = 0
+    if io_path is not None:
+        disk_read_bytes, disk_write_bytes = _read_cgroup_io_bytes(io_path)
+
+    out = {
+        "ok": True,
+        "container_id": container_id,
+        "memory_usage_bytes": int(memory_bytes),
+        "cpu_percent": float(cpu_percent),
+        "avg_cpu_percent": float(cpu_percent) if cpu_sample_valid else 0.0,
+        "cpu_sample_valid": bool(cpu_sample_valid),
+        "cpu_sample_elapsed_sec": float(cpu_sample_elapsed_sec) if cpu_sample_valid else 0.0,
+        "cpu_source": cpu_source,
+        "disk_read_bytes": int(disk_read_bytes),
+        "disk_write_bytes": int(disk_write_bytes),
+        "ts": now,
+        "stats_backend": "cgroup",
+    }
+    if include_raw:
+        out["raw"] = {
+            "memory_path": str(memory_path),
+            "cpu_path": str(cpu_path) if cpu_path is not None else "",
+            "cpu_source": cpu_source,
+            "cpu_sample_valid": bool(cpu_sample_valid),
+            "cpu_sample_elapsed_sec": float(cpu_sample_elapsed_sec) if cpu_sample_valid else 0.0,
+            "io_path": str(io_path) if io_path is not None else "",
+        }
+    return out
+
+
+def _cgroup_stats_for_containers(
+    container_ids: list[str],
+    *,
+    include_raw: bool = False,
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for container_id in [str(cid).strip() for cid in container_ids if str(cid).strip()]:
+        try:
+            out[container_id] = _cgroup_stats_for_container(container_id, include_raw=include_raw)
+        except Exception as exc:
+            out[container_id] = {
+                "ok": False,
+                "error": str(exc),
+                "container_id": container_id,
+                "ts": time.time(),
+                "stats_backend": "cgroup",
+            }
+    return out
+
+
+def _resource_stats_for_containers(
+    container_ids: list[str],
+    *,
+    timeout: int,
+    include_raw: bool = False,
+) -> dict[str, dict[str, Any]]:
+    backend = str(_SERVER_CONFIG.stats_backend or "cgroup").strip().lower()
+    if backend == "docker":
+        return _docker_stats_for_containers(container_ids, timeout=timeout, include_raw=include_raw)
+
+    cgroup_stats = _cgroup_stats_for_containers(container_ids, include_raw=include_raw)
+    if backend != "auto":
+        return cgroup_stats
+
+    missing = [cid for cid, item in cgroup_stats.items() if not item.get("ok", False)]
+    if not missing:
+        return cgroup_stats
+    try:
+        docker_stats = _docker_stats_for_containers(missing, timeout=timeout, include_raw=include_raw)
+        cgroup_stats.update(docker_stats)
+    except Exception:
+        pass
+    return cgroup_stats
+
+
+def _get_cached_container_stats(container_id: str, *, max_age_sec: float) -> dict[str, Any] | None:
+    now = time.time()
+    with _stats_cache_lock:
+        cached = _stats_cache.get(container_id)
+        if not isinstance(cached, dict):
+            return None
+        ts = float(cached.get("ts", 0.0) or 0.0)
+        if now - ts > max(0.0, float(max_age_sec)):
+            return None
+        return dict(cached)
+
+
+def _peak_number(existing: dict[str, Any], fresh: dict[str, Any], peak_key: str, value_key: str) -> float:
+    values: list[float] = []
+    for payload in (existing, fresh):
+        for key in (peak_key, value_key):
+            try:
+                values.append(float(payload.get(key, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                pass
+    return max(values) if values else 0.0
+
+
+def _merge_cached_container_stats(existing: dict[str, Any] | None, fresh: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(fresh)
+    fresh_cpu_valid = bool(fresh.get("cpu_sample_valid", False))
+    fresh_cpu_percent = float(fresh.get("cpu_percent", 0.0) or 0.0)
+    fresh_cpu_elapsed = float(fresh.get("cpu_sample_elapsed_sec", 0.0) or 0.0)
+    if fresh_cpu_valid and fresh_cpu_elapsed <= 0.0:
+        fresh_cpu_elapsed = 1.0
+
+    if not isinstance(existing, dict) or not existing.get("ok", False):
+        merged.setdefault("peak_memory_usage_bytes", merged.get("memory_usage_bytes", 0))
+        merged.setdefault("peak_cpu_percent", fresh_cpu_percent if fresh_cpu_valid else 0.0)
+        merged["avg_cpu_percent"] = fresh_cpu_percent if fresh_cpu_valid else 0.0
+        merged["cpu_percent"] = merged["avg_cpu_percent"]
+        merged.setdefault("peak_disk_read_bytes", merged.get("disk_read_bytes", 0))
+        merged.setdefault("peak_disk_write_bytes", merged.get("disk_write_bytes", 0))
+        merged.setdefault("cache_sample_count", 1)
+        merged.setdefault("cpu_sample_count", 1 if fresh_cpu_valid else 0)
+        merged["cpu_sample_elapsed_total_sec"] = fresh_cpu_elapsed if fresh_cpu_valid else 0.0
+        merged["cpu_percent_weighted_sum"] = (
+            fresh_cpu_percent * fresh_cpu_elapsed if fresh_cpu_valid else 0.0
+        )
+        merged["cpu_sample_valid"] = fresh_cpu_valid
+        merged.setdefault("cache_window_start_ts", merged.get("ts", time.time()))
+        return merged
+
+    existing_cpu_count = int(existing.get("cpu_sample_count", 0) or 0)
+    if existing_cpu_count <= 0 and bool(existing.get("cpu_sample_valid", False)):
+        existing_cpu_count = 1
+    cpu_sample_count = existing_cpu_count + (1 if fresh_cpu_valid else 0)
+    existing_cpu_elapsed = float(existing.get("cpu_sample_elapsed_total_sec", 0.0) or 0.0)
+    if existing_cpu_elapsed <= 0.0 and existing_cpu_count > 0:
+        existing_cpu_elapsed = float(existing_cpu_count)
+    existing_avg_cpu = float(
+        existing.get("avg_cpu_percent", existing.get("cpu_percent", 0.0)) or 0.0
+    )
+    existing_weighted_sum = float(
+        existing.get("cpu_percent_weighted_sum", existing_avg_cpu * existing_cpu_elapsed) or 0.0
+    )
+    fresh_weighted_sum = fresh_cpu_percent * fresh_cpu_elapsed if fresh_cpu_valid else 0.0
+    cpu_elapsed_total = existing_cpu_elapsed + (fresh_cpu_elapsed if fresh_cpu_valid else 0.0)
+    cpu_weighted_sum = existing_weighted_sum + fresh_weighted_sum
+    avg_cpu_percent = cpu_weighted_sum / cpu_elapsed_total if cpu_elapsed_total > 0.0 else 0.0
+
+    merged["peak_memory_usage_bytes"] = int(
+        _peak_number(existing, fresh, "peak_memory_usage_bytes", "memory_usage_bytes")
+    )
+    if fresh_cpu_valid:
+        merged["peak_cpu_percent"] = _peak_number(existing, fresh, "peak_cpu_percent", "cpu_percent")
+    else:
+        try:
+            merged["peak_cpu_percent"] = float(existing.get("peak_cpu_percent", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            merged["peak_cpu_percent"] = 0.0
+    merged["avg_cpu_percent"] = avg_cpu_percent
+    merged["cpu_percent"] = avg_cpu_percent
+    merged["peak_disk_read_bytes"] = int(
+        _peak_number(existing, fresh, "peak_disk_read_bytes", "disk_read_bytes")
+    )
+    merged["peak_disk_write_bytes"] = int(
+        _peak_number(existing, fresh, "peak_disk_write_bytes", "disk_write_bytes")
+    )
+    merged["cache_sample_count"] = int(existing.get("cache_sample_count", 1) or 1) + 1
+    merged["cpu_sample_count"] = cpu_sample_count
+    merged["cpu_sample_elapsed_total_sec"] = cpu_elapsed_total
+    merged["cpu_percent_weighted_sum"] = cpu_weighted_sum
+    merged["cpu_sample_valid"] = cpu_sample_count > 0
+    if not fresh_cpu_valid and existing.get("cpu_source"):
+        merged["cpu_source"] = existing.get("cpu_source")
+    merged["cache_window_start_ts"] = min(
+        float(existing.get("cache_window_start_ts", existing.get("ts", time.time())) or time.time()),
+        float(fresh.get("ts", time.time()) or time.time()),
+    )
+    return merged
+
+
+def _put_cached_container_stats(stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    merged_stats: dict[str, dict[str, Any]] = {}
+    if not stats:
+        return merged_stats
+    with _stats_cache_lock:
+        for container_id, payload in stats.items():
+            if isinstance(payload, dict) and payload.get("ok", False):
+                merged = _merge_cached_container_stats(
+                    _stats_cache.get(container_id),
+                    payload,
+                )
+                _stats_cache[container_id] = merged
+                merged_stats[container_id] = dict(merged)
+    return merged_stats
+
+
+def _stats_sampler_loop() -> None:
+    interval = max(0.2, float(_SERVER_CONFIG.stats_sampler_interval_sec))
+    timeout = max(1, int(_SERVER_CONFIG.stats_command_timeout_sec))
+    batch_size = max(1, int(_SERVER_CONFIG.stats_batch_max_containers))
+    while not _stats_sampler_stop.is_set():
+        with _lock:
+            active_ids = list(_active_containers.keys())
+        active_set = set(active_ids)
+        with _stats_cache_lock:
+            for cached_id in list(_stats_cache.keys()):
+                if cached_id not in active_set:
+                    _stats_cache.pop(cached_id, None)
+        for idx in range(0, len(active_ids), batch_size):
+            if _stats_sampler_stop.is_set():
+                break
+            chunk = active_ids[idx : idx + batch_size]
+            try:
+                _put_cached_container_stats(
+                    _resource_stats_for_containers(chunk, timeout=timeout, include_raw=False)
+                )
+            except Exception as exc:
+                logger.debug("background docker stats sample failed: %s", exc)
+        _stats_sampler_stop.wait(interval)
+
+
+def _ensure_stats_sampler_started() -> None:
+    global _stats_sampler_thread
+    if not _SERVER_CONFIG.stats_sampler_enabled:
+        return
+    with _stats_sampler_lock:
+        if _stats_sampler_thread is not None and _stats_sampler_thread.is_alive():
+            return
+        _stats_sampler_stop.clear()
+        _stats_sampler_thread = threading.Thread(
+            target=_stats_sampler_loop,
+            name="swe-exec-stats-sampler",
+            daemon=True,
+        )
+        _stats_sampler_thread.start()
+
+
+def _action_stats_sampler_loop() -> None:
+    while True:
+        interval = max(0.05, float(_SERVER_CONFIG.action_stats_interval_sec))
+        timeout = max(1, int(_SERVER_CONFIG.action_stats_command_timeout_sec))
+        batch_size = max(1, int(_SERVER_CONFIG.action_stats_batch_max_containers))
+        with _action_stats_sampler_lock:
+            active_ids = [
+                container_id
+                for container_id, ref_count in _action_stats_containers.items()
+                if ref_count > 0
+            ]
+
+        if not active_ids:
+            _action_stats_wakeup.wait(interval)
+            _action_stats_wakeup.clear()
+            continue
+
+        for idx in range(0, len(active_ids), batch_size):
+            chunk = active_ids[idx : idx + batch_size]
+            try:
+                _put_cached_container_stats(
+                    _resource_stats_for_containers(chunk, timeout=timeout, include_raw=False)
+                )
+            except Exception as exc:
+                logger.debug("action docker stats sample failed: %s", exc)
+
+        _action_stats_wakeup.wait(interval)
+        _action_stats_wakeup.clear()
+
+
+def _ensure_action_stats_sampler_started() -> None:
+    global _action_stats_sampler_thread
+    if not _SERVER_CONFIG.action_stats_sampler_enabled:
+        return
+    with _action_stats_sampler_lock:
+        if _action_stats_sampler_thread is not None and _action_stats_sampler_thread.is_alive():
+            return
+        _action_stats_sampler_thread = threading.Thread(
+            target=_action_stats_sampler_loop,
+            name="swe-exec-action-stats-sampler",
+            daemon=True,
+        )
+        _action_stats_sampler_thread.start()
+
+
+@contextlib.contextmanager
+def _action_stats_sampling_section(container_id: str) -> Any:
+    if not _SERVER_CONFIG.action_stats_sampler_enabled:
+        yield
+        return
+
+    container_id = str(container_id)
+    _ensure_action_stats_sampler_started()
+    with _action_stats_sampler_lock:
+        _action_stats_containers[container_id] += 1
+        _action_stats_wakeup.set()
+    try:
+        yield
+    finally:
+        # Capture one final point and merge it with any peaks collected while the
+        # command was running. The final point is usually cheap and helps for
+        # commands that leave memory resident briefly after exit.
+        try:
+            _put_cached_container_stats(
+                _resource_stats_for_containers(
+                    [container_id],
+                    timeout=max(1, int(_SERVER_CONFIG.action_stats_command_timeout_sec)),
+                    include_raw=False,
+                )
+            )
+        except Exception as exc:
+            logger.debug("final action docker stats sample failed for %s: %s", container_id[:12], exc)
+        with _action_stats_sampler_lock:
+            remaining = max(0, int(_action_stats_containers.get(container_id, 0)) - 1)
+            if remaining > 0:
+                _action_stats_containers[container_id] = remaining
+            else:
+                _action_stats_containers.pop(container_id, None)
+            _action_stats_wakeup.set()
+
+
+def _container_stats_cached_or_direct(container_id: str, *, include_raw: bool = False) -> dict[str, Any]:
+    _ensure_stats_sampler_started()
+    cached = _get_cached_container_stats(
+        container_id,
+        max_age_sec=max(0.0, float(_SERVER_CONFIG.stats_cache_ttl_sec)),
+    )
+    if cached is not None:
+        if include_raw:
+            cached = dict(cached)
+        return cached
+    stats = _resource_stats_for_containers(
+        [container_id],
+        timeout=max(1, int(_SERVER_CONFIG.stats_command_timeout_sec)),
+        include_raw=include_raw,
+    )
+    merged = _put_cached_container_stats(stats)
+    return merged.get(container_id) or stats.get(container_id, {"ok": False, "error": "empty docker stats output"})
 
 
 def _is_valid_git_patch(patch_text: str) -> bool:
@@ -1600,6 +2578,7 @@ def _checkpoint_create_dispatcher_worker() -> None:
                 job.checkpoint_image,
                 job.record,
                 job.runtime_env,
+                job.fault_injection_spec,
             )
         except Exception as exc:  # pragma: no cover - defensive, worker already catches internally
             job.error = exc
@@ -1638,6 +2617,7 @@ def _dispatch_checkpoint_create_and_wait(
     checkpoint_image: str,
     record: dict[str, Any],
     runtime_env: dict[str, str],
+    fault_injection_spec: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, float, float]:
     _ensure_checkpoint_create_dispatcher_started()
     enqueued_perf = time.perf_counter()
@@ -1648,6 +2628,7 @@ def _dispatch_checkpoint_create_and_wait(
         checkpoint_image=checkpoint_image,
         record=dict(record),
         runtime_env=dict(runtime_env),
+        fault_injection_spec=dict(fault_injection_spec) if fault_injection_spec else None,
         done_event=threading.Event(),
         enqueued_perf=enqueued_perf,
     )
@@ -1770,7 +2751,8 @@ def _checkpoint_create_worker(
     container_id: str,
     checkpoint_image: str,
     record: dict[str, Any],
-    runtime_env: dict[str, str],
+    runtime_env: dict[str, str] | None = None,
+    fault_injection_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     total_started_perf = time.perf_counter()
     exclusive_wait_sec = 0.0
@@ -1788,6 +2770,11 @@ def _checkpoint_create_worker(
     runtime_payload_build_sec = 0.0
     runtime_state_write_sec = 0.0
     post_commit_finalize_sec = 0.0
+    fault_spec = dict(fault_injection_spec or {})
+    runtime_env = dict(runtime_env or {})
+    record = dict(record or {})
+    if not record.get("checkpoint_id"):
+        record = dict(_CHECKPOINTS.get_checkpoint(checkpoint_id) or record)
     try:
         started_at = time.time()
         logger.info(
@@ -1857,6 +2844,45 @@ def _checkpoint_create_worker(
             _capture_runtime_state(container_id, checkpoint_id, runtime_state_payload)
             runtime_state_write_sec = time.perf_counter() - runtime_state_write_started_perf
             build_payload_sec = time.perf_counter() - build_payload_started_perf
+            if fault_spec.get("phase") == "before_commit":
+                fault_delay_sec = float(fault_spec.get("delay_sec", 0.0) or 0.0)
+                if fault_delay_sec > 0.0:
+                    time.sleep(fault_delay_sec)
+                fault_event = _inject_fail_stop_fault(
+                    container_id,
+                    fault_type="checkpoint_explicit_before_commit_kill",
+                    fault_phase="before_commit",
+                    delay_sec=fault_delay_sec,
+                    tag=str(fault_spec.get("tag", "") or ""),
+                    remove_tracking=True,
+                    drop_gate=True,
+                )
+                finished_at = time.time()
+                error = "injected checkpoint fault before docker commit"
+                _, checkpoint_stats = _CHECKPOINTS.update_checkpoint_with_stats(
+                    checkpoint_id,
+                    status="failed",
+                    failed_at=finished_at,
+                    error=error,
+                    **fault_event,
+                )
+                _, op_stats = _CHECKPOINTS.update_op_with_stats(
+                    op_id,
+                    status="failed",
+                    finished_at=finished_at,
+                    error=error,
+                )
+                checkpoint_persist_sec = float(checkpoint_stats.get("persist_sec", 0.0) or 0.0)
+                op_persist_sec = float(op_stats.get("persist_sec", 0.0) or 0.0)
+                metadata_bytes = int(op_stats.get("metadata_bytes", checkpoint_stats.get("metadata_bytes", 0)) or 0)
+                checkpoint_count = int(op_stats.get("checkpoint_count", checkpoint_stats.get("checkpoint_count", 0)) or 0)
+                op_count = int(op_stats.get("op_count", checkpoint_stats.get("op_count", 0)) or 0)
+                final_record = dict(_CHECKPOINTS.get_checkpoint(checkpoint_id) or {})
+                final_record["build_payload_sec"] = build_payload_sec
+                final_record["runtime_probe_sec"] = runtime_probe_sec
+                final_record["runtime_payload_build_sec"] = runtime_payload_build_sec
+                final_record["runtime_state_write_sec"] = runtime_state_write_sec
+                return final_record
             commit_section_wait_started_perf = time.perf_counter()
             with _commit_docker_section():
                 commit_section_wait_sec = time.perf_counter() - commit_section_wait_started_perf
@@ -1920,6 +2946,45 @@ def _checkpoint_create_worker(
             op_count = int(op_stats.get("op_count", checkpoint_stats.get("op_count", 0)) or 0)
             final_record = dict(_CHECKPOINTS.get_checkpoint(checkpoint_id) or {})
             final_record["build_payload_sec"] = build_payload_sec
+            return final_record
+
+        if fault_spec.get("phase") == "after_commit_before_ready":
+            fault_delay_sec = float(fault_spec.get("delay_sec", 0.0) or 0.0)
+            if fault_delay_sec > 0.0:
+                time.sleep(fault_delay_sec)
+            fault_event = _inject_fail_stop_fault(
+                container_id,
+                fault_type="checkpoint_explicit_after_commit_before_ready_kill",
+                fault_phase="after_commit_before_ready",
+                delay_sec=fault_delay_sec,
+                tag=str(fault_spec.get("tag", "") or ""),
+                remove_tracking=True,
+                drop_gate=True,
+            )
+            error = "injected checkpoint fault after docker commit before ready pointer update"
+            _, checkpoint_stats = _CHECKPOINTS.update_checkpoint_with_stats(
+                checkpoint_id,
+                status="failed",
+                failed_at=finished_at,
+                error=error,
+                **fault_event,
+            )
+            _, op_stats = _CHECKPOINTS.update_op_with_stats(
+                op_id,
+                status="failed",
+                finished_at=finished_at,
+                error=error,
+            )
+            checkpoint_persist_sec = float(checkpoint_stats.get("persist_sec", 0.0) or 0.0)
+            op_persist_sec = float(op_stats.get("persist_sec", 0.0) or 0.0)
+            metadata_bytes = int(op_stats.get("metadata_bytes", checkpoint_stats.get("metadata_bytes", 0)) or 0)
+            checkpoint_count = int(op_stats.get("checkpoint_count", checkpoint_stats.get("checkpoint_count", 0)) or 0)
+            op_count = int(op_stats.get("op_count", checkpoint_stats.get("op_count", 0)) or 0)
+            final_record = dict(_CHECKPOINTS.get_checkpoint(checkpoint_id) or {})
+            final_record["build_payload_sec"] = build_payload_sec
+            final_record["runtime_probe_sec"] = runtime_probe_sec
+            final_record["runtime_payload_build_sec"] = runtime_payload_build_sec
+            final_record["runtime_state_write_sec"] = runtime_state_write_sec
             return final_record
 
         raw_create_latency_sec = finished_at - started_at
@@ -2271,6 +3336,13 @@ def container_exec():
         )
         or 0.0
     )
+    try:
+        fault_injection_spec = _normalize_fault_injection_spec(
+            data.get("fault_injection_spec"),
+            allowed_phases=_EXEC_FAULT_PHASES,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc), "error_code": "invalid_fault_injection_spec"}), 400
 
     with _lock:
         active_info = _active_containers.get(str(container_id), {})
@@ -2285,6 +3357,25 @@ def container_exec():
     env_args = []
     for key, value in merged_env.items():
         env_args.extend(["-e", f"{key}={value}"])
+
+    if fault_injection_spec is not None and fault_injection_spec.get("phase") == "before_action":
+        event = _inject_fail_stop_fault(
+            str(container_id),
+            fault_type="exec_server_explicit_before_action_kill",
+            fault_phase="before_action",
+            delay_sec=float(fault_injection_spec.get("delay_sec", 0.0) or 0.0),
+            tag=str(fault_injection_spec.get("tag", "") or ""),
+            remove_tracking=True,
+            drop_gate=True,
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "returncode": -1,
+                "output": "Injected environment fault: container killed before exec.",
+                **event,
+            }
+        )
 
     injected_fault = _maybe_inject_exec_fault(
         str(container_id),
@@ -2301,14 +3392,59 @@ def container_exec():
             }
         )
 
+    mid_action_cancel_event: threading.Event | None = None
+    mid_action_thread: threading.Thread | None = None
+    mid_action_state: dict[str, Any] = {"event": None}
+    if fault_injection_spec is not None and fault_injection_spec.get("phase") == "mid_action":
+        fault_delay_sec = float(fault_injection_spec.get("delay_sec", 0.0) or 0.0)
+        active_info_snapshot = dict(active_info) if active_info else None
+        mid_action_cancel_event = threading.Event()
+
+        def _mid_action_fault_worker() -> None:
+            if mid_action_cancel_event is not None and mid_action_cancel_event.wait(timeout=fault_delay_sec):
+                return
+            mid_action_state["event"] = _inject_fail_stop_fault(
+                str(container_id),
+                fault_type="exec_server_explicit_mid_action_kill",
+                fault_phase="mid_action",
+                delay_sec=fault_delay_sec,
+                tag=str(fault_injection_spec.get("tag", "") or ""),
+                remove_tracking=False,
+                drop_gate=False,
+            )
+
+        mid_action_thread = threading.Thread(
+            target=_mid_action_fault_worker,
+            name=f"exec-mid-action-fault-{str(container_id)[:12]}",
+            daemon=True,
+        )
+        mid_action_thread.start()
+
     try:
         with _container_exec_section(container_id):
-            with _foreground_docker_section():
-                r = _docker(
-                    "exec", "-w", cwd, *env_args, container_id,
-                    "bash", "-lc", command,
-                    timeout=timeout,
-                )
+            with _action_stats_sampling_section(str(container_id)):
+                with _foreground_docker_section():
+                    r = _docker(
+                        "exec", "-w", cwd, *env_args, container_id,
+                        "bash", "-lc", command,
+                        timeout=timeout,
+                    )
+        if mid_action_cancel_event is not None:
+            mid_action_cancel_event.set()
+        if mid_action_thread is not None:
+            mid_action_thread.join(timeout=0.1)
+        if mid_action_state["event"] is not None:
+            with _lock:
+                _active_containers.pop(str(container_id), None)
+            _drop_container_op_gate(str(container_id))
+            return jsonify(
+                {
+                    "ok": True,
+                    "returncode": -1,
+                    "output": "Injected environment fault: container killed during exec.",
+                    **mid_action_state["event"],
+                }
+            )
         output = r.stdout + r.stderr
         return jsonify({
             "ok": True,
@@ -2318,6 +3454,22 @@ def container_exec():
             "container_usable": True,
         })
     except subprocess.TimeoutExpired:
+        if mid_action_cancel_event is not None:
+            mid_action_cancel_event.set()
+        if mid_action_thread is not None:
+            mid_action_thread.join(timeout=0.1)
+        if mid_action_state["event"] is not None:
+            with _lock:
+                _active_containers.pop(str(container_id), None)
+            _drop_container_op_gate(str(container_id))
+            return jsonify(
+                {
+                    "ok": True,
+                    "returncode": -1,
+                    "output": "Injected environment fault: container killed during exec.",
+                    **mid_action_state["event"],
+                }
+            )
         return jsonify({
             "ok": True,
             "returncode": -1,
@@ -2342,12 +3494,13 @@ def container_diff():
 
     cwd = data.get("cwd", "/testbed")
     with _container_exec_section(container_id):
-        with _foreground_docker_section():
-            r = _docker(
-                "exec", "-w", cwd, container_id,
-                "bash", "-lc", "git add -A && git diff --cached",
-                timeout=60,
-            )
+        with _action_stats_sampling_section(str(container_id)):
+            with _foreground_docker_section():
+                r = _docker(
+                    "exec", "-w", cwd, container_id,
+                    "bash", "-lc", "git add -A && git diff --cached",
+                    timeout=60,
+                )
     return jsonify({
         "ok": True,
         "patch": r.stdout,
@@ -2400,6 +3553,27 @@ def container_destroy():
     return jsonify({"ok": True, **release})
 
 
+@app.post("/container/fault/kill")
+def container_fault_kill():
+    """Inject a fail-stop fault into a live container without closing its lease."""
+    data = request.get_json(force=True) or {}
+    container_id = data.get("container_id")
+    if not container_id:
+        return jsonify({"ok": False, "error": "container_id is required"}), 400
+    delay_sec = float(data.get("delay_sec", 0.0) or 0.0)
+    tag = str(data.get("tag", "") or "")
+    event = _inject_fail_stop_fault(
+        str(container_id),
+        fault_type="exec_server_random_wall_clock_kill",
+        fault_phase="random_wall_clock",
+        delay_sec=delay_sec,
+        tag=tag,
+        remove_tracking=False,
+        drop_gate=False,
+    )
+    return jsonify({"ok": True, **event})
+
+
 @app.post("/container/checkpoint/probe")
 def container_checkpoint_probe():
     return jsonify({
@@ -2440,6 +3614,13 @@ def container_checkpoint_create():
     command_seq = int(data.get("command_seq", -1))
     policy = str(data.get("policy", ""))
     reason = str(data.get("reason", "manual"))
+    try:
+        fault_injection_spec = _normalize_fault_injection_spec(
+            data.get("fault_injection_spec"),
+            allowed_phases=_CHECKPOINT_FAULT_PHASES,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc), "error_code": "invalid_fault_injection_spec"}), 400
     logger.info(
         "checkpoint create request received lease_id=%s container_id=%s step_idx=%s command_seq=%s policy=%s reason=%s inflight_checkpoints=%s",
         lease_id,
@@ -2558,6 +3739,7 @@ def container_checkpoint_create():
             checkpoint_image=record["checkpoint_image"],
             record=record,
             runtime_env=runtime_env,
+            fault_injection_spec=fault_injection_spec,
         )
         worker_blocking_sec = time.perf_counter() - worker_started_perf
         build_payload_sec = float(final_record.get("build_payload_sec", 0.0) or 0.0) if final_record else 0.0
@@ -2647,6 +3829,10 @@ def container_checkpoint_create():
             "retryable": True,
             "checkpoint_id": final_record.get("checkpoint_id"),
             "status": final_record.get("status"),
+            "fault_injected": bool(final_record.get("fault_injected", False)),
+            "fault_type": final_record.get("fault_type"),
+            "fault_phase": final_record.get("fault_phase"),
+            "checkpoint_image": final_record.get("checkpoint_image"),
         })
     handler_sec = time.perf_counter() - request_started_perf
     logger.info(
@@ -2898,7 +4084,7 @@ def container_rerun():
 
 @app.post("/container/stats")
 def container_stats():
-    """Read one-shot docker stats for a running container.
+    """Read docker stats for a running container.
 
     Returns:
         {
@@ -2914,37 +4100,78 @@ def container_stats():
     if not container_id:
         return jsonify({"ok": False, "error": "container_id is required"}), 400
 
-    r = _docker("stats", "--no-stream", "--format", "{{json .}}", container_id, timeout=20)
-    if r.returncode != 0:
-        return jsonify({"ok": False, "error": r.stderr.strip() or "docker stats failed"}), 500
-
-    line = r.stdout.strip().splitlines()
-    if not line:
-        return jsonify({"ok": False, "error": "empty docker stats output"}), 500
-
     try:
-        payload = json.loads(line[-1])
+        out = _container_stats_cached_or_direct(str(container_id), include_raw=bool(data.get("include_raw", True)))
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"failed to parse docker stats json: {exc}"}), 500
-
-    mem_usage = (payload.get("MemUsage") or "0B / 0B").split("/", 1)[0].strip()
-    cpu_percent = _parse_percent(payload.get("CPUPerc", "0%"))
-    block_io = payload.get("BlockIO") or "0B / 0B"
-    if "/" in block_io:
-        read_txt, write_txt = [x.strip() for x in block_io.split("/", 1)]
-    else:
-        read_txt, write_txt = block_io.strip(), "0B"
-
-    out = {
-        "ok": True,
-        "memory_usage_bytes": _parse_size_to_bytes(mem_usage),
-        "cpu_percent": cpu_percent,
-        "disk_read_bytes": _parse_size_to_bytes(read_txt),
-        "disk_write_bytes": _parse_size_to_bytes(write_txt),
-        "raw": payload,
-        "ts": time.time(),
-    }
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    if not out.get("ok", False):
+        return jsonify(out), 500
     return jsonify(out)
+
+
+@app.post("/container/stats_batch")
+def container_stats_batch():
+    """Read docker stats for many running containers using cache + one batch call."""
+    data = request.get_json(force=True) or {}
+    raw_container_ids = data.get("container_ids")
+    if not isinstance(raw_container_ids, list) or not raw_container_ids:
+        return jsonify({"ok": False, "error": "container_ids must be a non-empty list"}), 400
+
+    max_items = max(1, int(_SERVER_CONFIG.stats_batch_max_containers))
+    requested: list[str] = []
+    seen: set[str] = set()
+    for item in raw_container_ids:
+        container_id = str(item or "").strip()
+        if not container_id or container_id in seen:
+            continue
+        requested.append(container_id)
+        seen.add(container_id)
+
+    if not requested:
+        return jsonify({"ok": False, "error": "container_ids contains no valid container id"}), 400
+
+    _ensure_stats_sampler_started()
+    include_raw = bool(data.get("include_raw", False))
+    ttl = max(0.0, float(_SERVER_CONFIG.stats_cache_ttl_sec))
+    stats: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    for container_id in requested:
+        cached = _get_cached_container_stats(container_id, max_age_sec=ttl)
+        if cached is None:
+            missing.append(container_id)
+        else:
+            stats[container_id] = cached
+
+    if missing:
+        for idx in range(0, len(missing), max_items):
+            chunk = missing[idx : idx + max_items]
+            try:
+                fresh = _resource_stats_for_containers(
+                    chunk,
+                    timeout=max(1, int(_SERVER_CONFIG.stats_command_timeout_sec)),
+                    include_raw=include_raw,
+                )
+                merged = _put_cached_container_stats(fresh)
+                stats.update(merged or fresh)
+            except Exception as exc:
+                for container_id in chunk:
+                    stats[container_id] = {
+                        "ok": False,
+                        "error": str(exc),
+                        "container_id": container_id,
+                        "ts": time.time(),
+                    }
+
+    response_stats: dict[str, dict[str, Any]] = {}
+    now = time.time()
+    for container_id in requested:
+        item = dict(stats.get(container_id) or {})
+        if not item:
+            item = {"ok": False, "error": "empty docker stats output", "ts": now}
+        item.setdefault("container_id", container_id)
+        response_stats[container_id] = item
+
+    return jsonify({"ok": True, "stats": response_stats, "requested": len(requested), "ts": now})
 
 
 # ── Evaluation (run test script inside a fresh container) ─────────────
@@ -2984,12 +4211,13 @@ def container_evaluate():
     # `git apply` would see the *already-changed* working tree and fail to find
     # the original context lines it needs to apply the diff.
     apply_cmd = "git reset --hard HEAD && git clean -fd && git apply -"
-    r_apply = _docker(
-        "exec", "-i", "-w", cwd, container_id,
-        "bash", "-lc", apply_cmd,
-        input_text=patch,
-        timeout=60,
-    )
+    with _action_stats_sampling_section(str(container_id)):
+        r_apply = _docker(
+            "exec", "-i", "-w", cwd, container_id,
+            "bash", "-lc", apply_cmd,
+            input_text=patch,
+            timeout=60,
+        )
     if r_apply.returncode != 0:
         return jsonify({
             "ok": True,
@@ -2999,12 +4227,13 @@ def container_evaluate():
 
     eval_cmd = "bash -s --"
     try:
-        r_eval = _docker(
-            "exec", "-i", "-w", cwd, container_id,
-            "bash", "-lc", eval_cmd,
-            input_text=eval_script,
-            timeout=timeout,
-        )
+        with _action_stats_sampling_section(str(container_id)):
+            r_eval = _docker(
+                "exec", "-i", "-w", cwd, container_id,
+                "bash", "-lc", eval_cmd,
+                input_text=eval_script,
+                timeout=timeout,
+            )
         resolved = r_eval.returncode == 0
         return jsonify({
             "ok": True,
@@ -3034,7 +4263,7 @@ def main():
     )
     _CONTAINER_POOL.warmup(block=False)
     logger.info(
-        "Starting SWE exec server on %s:%s pool_enabled=%s config=%s per_image=%s total_cap=%s prewarm_target=%s prewarm_ratio=%.2f create_timeout=%ss prewarm_mode=serial stats_dir=%s",
+        "Starting SWE exec server on %s:%s pool_enabled=%s config=%s per_image=%s total_cap=%s prewarm_target=%s prewarm_ratio=%.2f create_timeout=%ss prewarm_mode=serial stats_backend=%s action_stats=%s action_interval=%.3fs stats_dir=%s",
         args.host,
         args.port,
         _SERVER_CONFIG.use_container_pool,
@@ -3044,6 +4273,9 @@ def main():
         _CONTAINER_POOL._target_total_count(),
         _SERVER_CONFIG.pool_prewarm_ratio,
         _SERVER_CONFIG.pool_create_timeout_sec,
+        _SERVER_CONFIG.stats_backend,
+        _SERVER_CONFIG.action_stats_sampler_enabled,
+        _SERVER_CONFIG.action_stats_interval_sec,
         _SERVER_CONFIG.pool_resource_stats_dir,
     )
     app.run(host=args.host, port=args.port, threaded=True)

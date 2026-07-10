@@ -212,6 +212,94 @@ class TestSweEnvPoolCheckpoint(unittest.TestCase):
             {"PATH": "/opt/venv/bin:/usr/bin", "VIRTUAL_ENV": "/opt/venv"},
         )
 
+    def test_exec_forwards_fault_injection_spec_when_present(self):
+        pool = make_pool()
+        lease = pool_server.Lease(
+            lease_id="lease-1",
+            node_url="http://node-1:5000",
+            container_id="cid-1",
+            image="img:base",
+            instance_id="inst-1",
+            cwd="/workspace",
+            generation=2,
+        )
+        pool._leases[lease.lease_id] = lease  # pylint: disable=protected-access
+        seen: list[tuple[str, dict, int]] = []
+
+        def fake_post(url: str, payload: dict, timeout: int = 300) -> dict:
+            seen.append((url, payload, timeout))
+            return {"ok": True, "returncode": -1}
+
+        with patch.object(pool_server, "_post_exec", new=fake_post):
+            out = pool.exec(
+                "lease-1",
+                "sleep 1",
+                fault_injection_spec={"phase": "mid_action", "delay_sec": 0.5},
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(
+            seen[0][1]["fault_injection_spec"],
+            {"phase": "mid_action", "delay_sec": 0.5},
+        )
+
+    def test_inject_fail_stop_forwards_to_current_container_without_closing_lease(self):
+        pool = make_pool()
+        lease = pool_server.Lease(
+            lease_id="lease-1",
+            node_url="http://node-1:5000",
+            container_id="cid-1",
+            image="img:base",
+            instance_id="inst-1",
+            cwd="/workspace",
+            generation=2,
+        )
+        pool._leases[lease.lease_id] = lease  # pylint: disable=protected-access
+        seen: list[tuple[str, dict, int]] = []
+
+        def fake_post(url: str, payload: dict, timeout: int = 300) -> dict:
+            seen.append((url, payload, timeout))
+            return {"ok": True, "fault_injected": True}
+
+        with patch.object(pool_server, "_post_exec", new=fake_post):
+            out = pool.inject_fail_stop("lease-1", tag="trial-1", delay_sec=0.25)
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["fault_injected"])
+        self.assertIn("lease-1", pool._leases)  # pylint: disable=protected-access
+        self.assertEqual(seen[0][0], "http://node-1:5000/container/fault/kill")
+        self.assertEqual(seen[0][1], {"container_id": "cid-1", "tag": "trial-1", "delay_sec": 0.25})
+
+    def test_checkpoint_create_forwards_fault_injection_spec_when_present(self):
+        pool = make_pool()
+        lease = pool_server.Lease(
+            lease_id="lease-1",
+            node_url="http://node-1:5000",
+            container_id="cid-1",
+            image="img:base",
+            instance_id="inst-1",
+            cwd="/workspace",
+            generation=2,
+        )
+        pool._leases[lease.lease_id] = lease  # pylint: disable=protected-access
+        seen: list[tuple[str, dict, int]] = []
+
+        def fake_post(url: str, payload: dict, timeout: int = 300) -> dict:
+            seen.append((url, payload, timeout))
+            return {"ok": True, "checkpoint_id": "ckpt-1"}
+
+        with patch.object(pool_server, "_post_exec", new=fake_post):
+            out = pool.checkpoint_create(
+                "lease-1",
+                fault_injection_spec={"phase": "after_commit_before_ready"},
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(
+            seen[0][1]["fault_injection_spec"],
+            {"phase": "after_commit_before_ready"},
+        )
+
     def test_checkpoint_status_updates_latest_ready_checkpoint(self):
         pool = make_pool()
         lease = pool_server.Lease(

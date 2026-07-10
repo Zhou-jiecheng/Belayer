@@ -169,6 +169,94 @@ class TestSweExecCheckpoint(unittest.TestCase):
         with exec_server._lock:  # pylint: disable=protected-access
             self.assertNotIn("cid-1", exec_server._active_containers)
 
+    def test_container_exec_supports_explicit_before_action_fault(self):
+        with mock.patch.object(
+            exec_server.request,
+            "get_json",
+            return_value={
+                "container_id": "cid-1",
+                "command": "echo hello",
+                "fault_injection_spec": {"phase": "before_action"},
+            },
+        ), mock.patch.object(exec_server._CONTAINER_POOL, "release", return_value={  # pylint: disable=protected-access
+            "pooled": False,
+            "destroyed": True,
+            "reason": "pool_disabled",
+        }) as mock_release, mock.patch.object(exec_server, "_docker") as docker_mock:
+            with exec_server._lock:  # pylint: disable=protected-access
+                exec_server._active_containers["cid-1"] = {
+                    "image": "img",
+                    "name": "name",
+                    "cwd": "/testbed",
+                }
+            out = exec_server.container_exec()
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["fault_injected"])
+        self.assertEqual(out["fault_phase"], "before_action")
+        self.assertEqual(out["returncode"], -1)
+        mock_release.assert_called_once()
+        docker_mock.assert_not_called()
+
+    def test_container_exec_supports_explicit_mid_action_fault(self):
+        docker_result = exec_server.subprocess.CompletedProcess(
+            args=["docker", "exec"],
+            returncode=137,
+            stdout="",
+            stderr="container killed",
+        )
+        with mock.patch.object(
+            exec_server.request,
+            "get_json",
+            return_value={
+                "container_id": "cid-1",
+                "command": "sleep 1",
+                "fault_injection_spec": {"phase": "mid_action", "delay_sec": 0.0},
+            },
+        ), mock.patch.object(exec_server._CONTAINER_POOL, "release", return_value={  # pylint: disable=protected-access
+            "pooled": False,
+            "destroyed": True,
+            "reason": "pool_disabled",
+        }) as mock_release, mock.patch.object(exec_server, "_docker", return_value=docker_result):
+            with exec_server._lock:  # pylint: disable=protected-access
+                exec_server._active_containers["cid-1"] = {
+                    "image": "img",
+                    "name": "name",
+                    "cwd": "/testbed",
+                }
+            out = exec_server.container_exec()
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["fault_injected"])
+        self.assertEqual(out["fault_phase"], "mid_action")
+        self.assertEqual(out["returncode"], -1)
+        mock_release.assert_called_once()
+        with exec_server._lock:  # pylint: disable=protected-access
+            self.assertNotIn("cid-1", exec_server._active_containers)
+
+    def test_container_fault_kill_keeps_tracking_for_rerun(self):
+        with mock.patch.object(
+            exec_server.request,
+            "get_json",
+            return_value={"container_id": "cid-1", "tag": "trial-1", "delay_sec": 0.25},
+        ), mock.patch.object(exec_server, "_inject_fail_stop_fault", return_value={
+            "fault_injected": True,
+            "fault_phase": "random_wall_clock",
+        }) as mock_inject:
+            out = exec_server.container_fault_kill()
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["fault_injected"])
+        mock_inject.assert_called_once_with(
+            "cid-1",
+            fault_type="exec_server_random_wall_clock_kill",
+            fault_phase="random_wall_clock",
+            delay_sec=0.25,
+            tag="trial-1",
+            remove_tracking=False,
+            drop_gate=False,
+        )
+
     def test_checkpoint_gc_plan_keeps_ancestors_of_retained_checkpoint(self):
         records = [
             {
@@ -414,6 +502,126 @@ class TestSweExecCheckpoint(unittest.TestCase):
             self.assertEqual(manager.inflight_count(), 0)
             sleep_mock.assert_called_once()
             self.assertAlmostEqual(sleep_mock.call_args.args[0], 1.8)
+
+    def test_checkpoint_worker_supports_explicit_before_commit_fault(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = exec_server.CheckpointManager(tmpdir, enabled=True, max_inflight=1)
+            self.assertTrue(manager.try_begin_create())
+            record, op = manager.create_checkpoint(
+                lease_id="lease-1",
+                generation=0,
+                container_id="cid-live",
+                instance_id="inst-1",
+                image="img:base",
+                cwd="/testbed",
+                step_idx=1,
+                command_seq=1,
+                policy="manual",
+                reason="test",
+                parent_checkpoint_id=None,
+            )
+            probe_result = exec_server.subprocess.CompletedProcess(
+                args=["docker", "exec"],
+                returncode=0,
+                stdout='{"PATH":"/usr/bin:/bin","PYTHONPATH":"","VIRTUAL_ENV":"","CONDA_PREFIX":""}\n',
+                stderr="",
+            )
+            with exec_server._lock:  # pylint: disable=protected-access
+                exec_server._active_containers["cid-live"] = {
+                    "image": "img:base",
+                    "name": "name",
+                    "cwd": "/testbed",
+                }
+            with mock.patch.object(exec_server, "_CHECKPOINTS", manager), mock.patch.object(
+                exec_server, "_container_is_active", return_value=True
+            ), mock.patch.object(exec_server, "_docker_container_is_running", return_value=True), mock.patch.object(
+                exec_server, "_docker", return_value=probe_result
+            ), mock.patch.object(exec_server._CONTAINER_POOL, "release", return_value={  # pylint: disable=protected-access
+                "pooled": False,
+                "destroyed": True,
+                "reason": "pool_disabled",
+            }) as mock_release:
+                out = exec_server._checkpoint_create_worker(  # pylint: disable=protected-access
+                    op["op_id"],
+                    record["checkpoint_id"],
+                    "cid-live",
+                    record["checkpoint_image"],
+                    record,
+                    {},
+                    {"phase": "before_commit"},
+                )
+
+            self.assertEqual(out["status"], "failed")
+            self.assertTrue(out["fault_injected"])
+            self.assertEqual(out["fault_phase"], "before_commit")
+            self.assertEqual(manager.inflight_count(), 0)
+            mock_release.assert_called_once()
+
+    def test_checkpoint_worker_supports_explicit_after_commit_before_ready_fault(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = exec_server.CheckpointManager(tmpdir, enabled=True, max_inflight=1)
+            self.assertTrue(manager.try_begin_create())
+            record, op = manager.create_checkpoint(
+                lease_id="lease-1",
+                generation=0,
+                container_id="cid-live",
+                instance_id="inst-1",
+                image="img:base",
+                cwd="/testbed",
+                step_idx=1,
+                command_seq=1,
+                policy="manual",
+                reason="test",
+                parent_checkpoint_id=None,
+            )
+            probe_result = exec_server.subprocess.CompletedProcess(
+                args=["docker", "exec"],
+                returncode=0,
+                stdout='{"PATH":"/usr/bin:/bin","PYTHONPATH":"","VIRTUAL_ENV":"","CONDA_PREFIX":""}\n',
+                stderr="",
+            )
+            capture_result = exec_server.subprocess.CompletedProcess(
+                args=["docker", "exec", "-i"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+            commit_result = exec_server.subprocess.CompletedProcess(
+                args=["docker", "commit"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+            with exec_server._lock:  # pylint: disable=protected-access
+                exec_server._active_containers["cid-live"] = {
+                    "image": "img:base",
+                    "name": "name",
+                    "cwd": "/testbed",
+                }
+            with mock.patch.object(exec_server, "_CHECKPOINTS", manager), mock.patch.object(
+                exec_server, "_container_is_active", return_value=True
+            ), mock.patch.object(exec_server, "_docker_container_is_running", return_value=True), mock.patch.object(
+                exec_server, "_docker", side_effect=[probe_result, capture_result, commit_result]
+            ), mock.patch.object(exec_server._CONTAINER_POOL, "release", return_value={  # pylint: disable=protected-access
+                "pooled": False,
+                "destroyed": True,
+                "reason": "pool_disabled",
+            }) as mock_release:
+                out = exec_server._checkpoint_create_worker(  # pylint: disable=protected-access
+                    op["op_id"],
+                    record["checkpoint_id"],
+                    "cid-live",
+                    record["checkpoint_image"],
+                    record,
+                    {},
+                    {"phase": "after_commit_before_ready"},
+                )
+
+            self.assertEqual(out["status"], "failed")
+            self.assertTrue(out["fault_injected"])
+            self.assertEqual(out["fault_phase"], "after_commit_before_ready")
+            self.assertEqual(manager.inflight_count(), 0)
+            mock_release.assert_called_once()
 
     def test_checkpoint_gc_returns_after_queueing_background_work(self):
         started: list[tuple] = []

@@ -19,15 +19,28 @@ import json
 import os
 import re
 import time
-import yaml
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - lightweight replay/import environments
+    yaml = None
 
 from loguru import logger
 
-from slime.rollout.sglang_rollout import GenerateState
-from slime.utils.types import Sample
+try:
+    from slime.rollout.sglang_rollout import GenerateState
+    from slime.utils.types import Sample
+except Exception:  # pragma: no cover - replay tools do not need the training stack
+    GenerateState = None
+
+    class Sample:  # type: ignore[no-redef]
+        class Status:
+            ABORTED = "aborted"
+            COMPLETED = "completed"
 
 from checkpoint_policy_runtime import (
     POLICIES,
@@ -166,6 +179,11 @@ def _get_sweagent_config() -> dict:
     for candidate in [config_path, Path(config_path)]:
         p = Path(candidate)
         if p.exists():
+            if yaml is None:
+                raise RuntimeError(
+                    f"PyYAML is required to load SWE config: {p}. "
+                    "Install pyyaml or run with the project Python environment."
+                )
             return yaml.safe_load(p.read_text())
     raise FileNotFoundError(f"SWE config not found: {config_path}")
 
@@ -360,6 +378,133 @@ def _parse_bash_action(response_text: str) -> str | None:
     if match:
         return match.group(1).strip()
     return None
+
+
+class TrajectoryReplayCompletionProvider:
+    """Replay assistant turns from a saved SWE trajectory while simulating LLM latency."""
+
+    def __init__(
+        self,
+        trajectory_payload: dict[str, Any],
+        *,
+        llm_delay_scale: float = 1.0,
+        min_delay_sec: float = 0.0,
+        max_delay_sec: float | None = None,
+        strict_action_match: bool = False,
+        traj_label: str = "",
+    ):
+        self.trajectory_payload = trajectory_payload
+        self.llm_delay_scale = max(0.0, float(llm_delay_scale))
+        self.min_delay_sec = max(0.0, float(min_delay_sec))
+        self.max_delay_sec = None if max_delay_sec is None else max(0.0, float(max_delay_sec))
+        self.strict_action_match = bool(strict_action_match)
+        self.traj_label = traj_label or str(
+            trajectory_payload.get("info", {}).get("instance_id", "unknown")
+            if isinstance(trajectory_payload.get("info"), dict)
+            else "unknown"
+        )
+        self.assistant_turns = [
+            str(item.get("content", "") or "")
+            for item in trajectory_payload.get("messages", [])
+            if isinstance(item, dict) and item.get("role") == "assistant"
+        ]
+        self.recorded_steps = [
+            item
+            for item in trajectory_payload.get("step_debug", [])
+            if isinstance(item, dict)
+        ]
+        self.turn_idx = 0
+        self.action_idx = 0
+        self.action_mismatches: list[dict[str, Any]] = []
+
+    @classmethod
+    def from_path(
+        cls,
+        traj_path: str | Path,
+        *,
+        llm_delay_scale: float = 1.0,
+        min_delay_sec: float = 0.0,
+        max_delay_sec: float | None = None,
+        strict_action_match: bool = False,
+    ) -> "TrajectoryReplayCompletionProvider":
+        path = Path(traj_path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return cls(
+            payload,
+            llm_delay_scale=llm_delay_scale,
+            min_delay_sec=min_delay_sec,
+            max_delay_sec=max_delay_sec,
+            strict_action_match=strict_action_match,
+            traj_label=path.parent.name,
+        )
+
+    def _delay_for_turn(self, assistant_text: str) -> float:
+        parsed_action = _parse_bash_action(assistant_text)
+        if parsed_action is None:
+            return self.min_delay_sec
+
+        if self.action_idx >= len(self.recorded_steps):
+            return self.min_delay_sec
+
+        step = self.recorded_steps[self.action_idx]
+        expected_action = str(step.get("action", "") or "").strip()
+        parsed_action_stripped = parsed_action.strip()
+        if expected_action and expected_action != parsed_action_stripped:
+            mismatch = {
+                "turn_idx": self.turn_idx,
+                "action_idx": self.action_idx,
+                "expected_action": expected_action,
+                "parsed_action": parsed_action_stripped,
+            }
+            self.action_mismatches.append(mismatch)
+            message = (
+                f"[SWE-R] [{self.traj_label}] replay action mismatch "
+                f"turn={self.turn_idx} action_idx={self.action_idx}"
+            )
+            if self.strict_action_match:
+                raise ValueError(f"{message}: {mismatch}")
+            logger.warning("{} expected={!r} parsed={!r}", message, expected_action[:240], parsed_action_stripped[:240])
+
+        try:
+            raw_delay = float(step.get("llm_elapsed", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            raw_delay = 0.0
+        self.action_idx += 1
+        delay = max(self.min_delay_sec, raw_delay * self.llm_delay_scale)
+        if self.max_delay_sec is not None:
+            delay = min(delay, self.max_delay_sec)
+        return delay
+
+    async def acompletion(self, *, model: str, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+        if self.turn_idx >= len(self.assistant_turns):
+            raise RuntimeError(
+                f"trajectory replay exhausted assistant turns at turn={self.turn_idx} "
+                f"traj={self.traj_label}"
+            )
+        assistant_text = self.assistant_turns[self.turn_idx]
+        delay = self._delay_for_turn(assistant_text)
+        self.turn_idx += 1
+        if delay > 0.0:
+            await asyncio.sleep(delay)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=assistant_text),
+                )
+            ]
+        )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "traj_label": self.traj_label,
+            "assistant_turn_count": len(self.assistant_turns),
+            "assistant_turns_used": self.turn_idx,
+            "recorded_action_count": len(self.recorded_steps),
+            "recorded_actions_used": self.action_idx,
+            "action_mismatch_count": len(self.action_mismatches),
+            "action_mismatches": self.action_mismatches[:20],
+            "llm_delay_scale": self.llm_delay_scale,
+        }
 
 
 def _extract_patch_from_submission(output: str) -> str:
@@ -863,10 +1008,14 @@ async def _run_agent_remote(
     fault_injection_probability: float = 0.0,
     docker_create_limiter: _DockerCreateLimiter | None = None,
     image_name: str = "",
+    replay_completion_provider: TrajectoryReplayCompletionProvider | None = None,
 ) -> dict:
     """Run the multi-turn agent loop using remote Docker execution."""
-    import litellm
-    from litellm import acompletion
+    acompletion = None
+    if replay_completion_provider is None:
+        from litellm import acompletion as litellm_acompletion
+
+        acompletion = litellm_acompletion
 
     iid = instance.get("instance_id", "unknown")
     agent_config = sweagent_config.get("agent", {})
@@ -878,14 +1027,21 @@ async def _run_agent_remote(
     openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or "dummy"
     litellm_timeout = float(os.environ.get("SWE_LITELLM_TIMEOUT", "600"))
 
-    logger.info(
-        "[SWE-R] [{}] LiteLLM request config: model={}, api_base={}, api_key_source={}, timeout={}",
-        iid,
-        litellm_model_name,
-        openai_api_base or "<unset>",
-        "env" if os.environ.get("OPENAI_API_KEY", "").strip() else "dummy",
-        litellm_timeout,
-    )
+    if replay_completion_provider is None:
+        logger.info(
+            "[SWE-R] [{}] LiteLLM request config: model={}, api_base={}, api_key_source={}, timeout={}",
+            iid,
+            litellm_model_name,
+            openai_api_base or "<unset>",
+            "env" if os.environ.get("OPENAI_API_KEY", "").strip() else "dummy",
+            litellm_timeout,
+        )
+    else:
+        logger.info(
+            "[SWE-R] [{}] trajectory replay completion enabled: {}",
+            iid,
+            replay_completion_provider.summary(),
+        )
 
     system_template = agent_config.get("system_template", "You are a helpful assistant.")
     instance_template = agent_config.get("instance_template", "{{task}}")
@@ -961,11 +1117,20 @@ async def _run_agent_remote(
                 completion_kwargs["api_key"] = openai_api_key
             if "timeout" not in completion_kwargs:
                 completion_kwargs["timeout"] = litellm_timeout
-            llm_task = asyncio.create_task(acompletion(
-                model=litellm_model_name,
-                messages=ctx_messages,
-                **completion_kwargs,
-            ))
+            if replay_completion_provider is None:
+                assert acompletion is not None
+                completion_coro = acompletion(
+                    model=litellm_model_name,
+                    messages=ctx_messages,
+                    **completion_kwargs,
+                )
+            else:
+                completion_coro = replay_completion_provider.acompletion(
+                    model=litellm_model_name,
+                    messages=ctx_messages,
+                    **completion_kwargs,
+                )
+            llm_task = asyncio.create_task(completion_coro)
             resp, llm_waited_before_exec_sec = await _wait_for_llm_with_adaptive_checkpointing(
                 llm_task=llm_task,
                 env_client=env_client,
@@ -1229,6 +1394,11 @@ async def _run_agent_remote(
         "failure_events": checkpoint_state["failure_events"],
         "rerun_events": checkpoint_state["rerun_events"],
         "phase_events": phase_events,
+        "replay_completion": (
+            replay_completion_provider.summary()
+            if replay_completion_provider is not None
+            else None
+        ),
         "checkpoint_metrics": {
             "checkpoint_attempts": checkpoint_state["checkpoint_attempts"],
             "checkpoint_created": checkpoint_state["checkpoint_created"],
@@ -1285,6 +1455,11 @@ async def _generate_impl(
     rollout_timeout: float,
 ) -> Sample | list[Sample]:
     """Core implementation — runtime timeout starts after the agent container is ready."""
+    if GenerateState is None:
+        raise RuntimeError(
+            "The slime training runtime is required for generate(); "
+            "install the slime dependencies or use the replay runner entrypoint."
+        )
     _ensure_openai_base_url(args)
     state = GenerateState(args)
     instance = sample.metadata.get("instance", {})
@@ -1384,6 +1559,7 @@ async def _generate_impl(
     timed_out = False
     agent_runtime_timeout = float(os.getenv("SWE_AGENT_RUNTIME_TIMEOUT", str(rollout_timeout)))
     eval_runtime_timeout = float(os.getenv("SWE_EVAL_TIMEOUT", str(rollout_timeout)))
+    eval_wait_timeout = float(os.getenv("SWE_EVALUATE_WAIT_TIMEOUT_SEC", str(eval_runtime_timeout + 60.0)))
 
     async def _run_after_semaphore() -> None:
         nonlocal lease_id, eval_lease_id, eval_slot_acquired, run_info
@@ -1469,8 +1645,9 @@ async def _generate_impl(
                             lease_id=eval_lease_id,
                             patch=git_patch,
                             eval_script=instance.get("eval_script", ""),
+                            timeout=eval_runtime_timeout,
                         ),
-                        timeout=eval_runtime_timeout,
+                        timeout=eval_wait_timeout,
                     )
                 except (asyncio.TimeoutError, TimeoutError):
                     raise TimeoutError(f"eval_timeout_after_container_ready:{eval_runtime_timeout}")

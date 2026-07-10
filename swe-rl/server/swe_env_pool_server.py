@@ -290,7 +290,8 @@ class SweEnvPool:
     def exec(self, lease_id: str, command: str, cwd: str = "/testbed",
              timeout: int = 180, env: dict | None = None,
              fault_injection_armed: bool = False,
-             fault_injection_probability: float | None = None) -> dict[str, Any]:
+             fault_injection_probability: float | None = None,
+             fault_injection_spec: dict[str, Any] | None = None) -> dict[str, Any]:
         lease = self._get_lease(lease_id)
         lease.last_heartbeat = time.time()
         payload: dict[str, Any] = {
@@ -303,6 +304,8 @@ class SweEnvPool:
         }
         if fault_injection_probability is not None:
             payload["fault_injection_probability"] = float(fault_injection_probability)
+        if fault_injection_spec:
+            payload["fault_injection_spec"] = dict(fault_injection_spec)
         return _post_exec(f"{lease.node_url}/container/exec", payload, timeout=timeout + 30)
 
     def diff(self, lease_id: str, cwd: str = "/testbed") -> dict[str, Any]:
@@ -340,6 +343,19 @@ class SweEnvPool:
             self._unreserve_node(node)
         logger.info("Closed lease=%s cid=%s", lease_id, removed.container_id[:12])
 
+    def inject_fail_stop(self, lease_id: str, *, tag: str = "", delay_sec: float = 0.0) -> dict[str, Any]:
+        lease = self._get_lease(lease_id)
+        lease.last_heartbeat = time.time()
+        return _post_exec(
+            f"{lease.node_url}/container/fault/kill",
+            {
+                "container_id": lease.container_id,
+                "tag": tag,
+                "delay_sec": float(delay_sec),
+            },
+            timeout=60,
+        )
+
     def checkpoint_probe(self, lease_id: str) -> dict[str, Any]:
         lease = self._get_lease(lease_id)
         lease.last_heartbeat = time.time()
@@ -365,6 +381,7 @@ class SweEnvPool:
         policy: str = "",
         reason: str = "manual",
         parent_checkpoint_id: str | None = None,
+        fault_injection_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         lease = self._get_lease(lease_id)
         lease.last_heartbeat = time.time()
@@ -383,6 +400,8 @@ class SweEnvPool:
         }
         if env:
             payload["env"] = env
+        if fault_injection_spec:
+            payload["fault_injection_spec"] = dict(fault_injection_spec)
         started_perf = time.perf_counter()
         try:
             result = _post_exec(f"{lease.node_url}/container/checkpoint/create", payload, timeout=30)
@@ -621,6 +640,76 @@ class SweEnvPool:
             "instance_id": lease.instance_id,
             **result,
         }
+
+    def stats_batch(self, lease_ids: list[str]) -> dict[str, Any]:
+        requested = [str(item).strip() for item in lease_ids if str(item).strip()]
+        if not requested:
+            return {"ok": True, "stats": {}}
+
+        stats: dict[str, dict[str, Any]] = {}
+        grouped: dict[str, list[tuple[str, Lease]]] = {}
+        with self._lock:
+            for lease_id in requested:
+                lease = self._leases.get(lease_id)
+                if lease is None:
+                    stats[lease_id] = {
+                        "ok": False,
+                        "error": f"Unknown lease_id: {lease_id}",
+                        "error_code": "unknown_lease_id",
+                        "lease_id": lease_id,
+                    }
+                    continue
+                grouped.setdefault(lease.node_url, []).append((lease_id, lease))
+
+        def _decorate(lease_id: str, lease: Lease, item: dict[str, Any]) -> dict[str, Any]:
+            payload = dict(item)
+            payload.setdefault("ok", False)
+            payload.update(
+                {
+                    "lease_id": lease_id,
+                    "container_id": lease.container_id,
+                    "node_url": lease.node_url,
+                    "image": lease.image,
+                    "base_image": lease.base_image,
+                    "current_image": lease.current_image or lease.image,
+                    "instance_id": lease.instance_id,
+                }
+            )
+            return payload
+
+        for node_url, leases in grouped.items():
+            try:
+                batch_result = _post_exec(
+                    f"{node_url}/container/stats_batch",
+                    {"container_ids": [lease.container_id for _, lease in leases]},
+                    timeout=30,
+                )
+                if not batch_result.get("ok", False):
+                    raise RuntimeError(f"batch stats failed: {batch_result}")
+                by_container = batch_result.get("stats")
+                if not isinstance(by_container, dict):
+                    raise RuntimeError(f"batch stats returned invalid payload: {batch_result}")
+                for lease_id, lease in leases:
+                    item = by_container.get(lease.container_id)
+                    if not isinstance(item, dict):
+                        item = {"ok": False, "error": "missing container stats in batch response"}
+                    stats[lease_id] = _decorate(lease_id, lease, item)
+                continue
+            except Exception as batch_exc:
+                logger.debug("stats_batch failed for node=%s, falling back to per-lease stats: %s", node_url, batch_exc)
+
+            for lease_id, lease in leases:
+                try:
+                    item = _post_exec(
+                        f"{lease.node_url}/container/stats",
+                        {"container_id": lease.container_id},
+                        timeout=30,
+                    )
+                except Exception as exc:
+                    item = {"ok": False, "error": str(exc), "error_code": "stats_unavailable"}
+                stats[lease_id] = _decorate(lease_id, lease, item)
+
+        return {"ok": True, "stats": stats}
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -866,6 +955,7 @@ def exec_cmd():
             env=data.get("env"),
             fault_injection_armed=bool(data.get("fault_injection_armed", False)),
             fault_injection_probability=data.get("fault_injection_probability"),
+            fault_injection_spec=data.get("fault_injection_spec"),
         )
         return jsonify(result)
     except Exception as e:
@@ -925,6 +1015,25 @@ def close():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/fault/kill")
+def fault_kill():
+    if POOL is None:
+        return jsonify({"ok": False, "error": "Pool not initialized"}), 500
+    data = flask_request.get_json(force=True) or {}
+    lease_id = data.get("lease_id")
+    if not lease_id:
+        return jsonify({"ok": False, "error": "lease_id required"}), 400
+    try:
+        result = POOL.inject_fail_stop(
+            lease_id=str(lease_id),
+            tag=str(data.get("tag", "") or ""),
+            delay_sec=float(data.get("delay_sec", 0.0) or 0.0),
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/stats")
 def stats():
     if POOL is None:
@@ -948,6 +1057,27 @@ def stats():
                 "error_code": "stats_unavailable",
                 "retryable": False,
                 "lease_id": lease_id,
+            }
+        )
+
+
+@app.post("/stats_batch")
+def stats_batch():
+    if POOL is None:
+        return jsonify({"ok": False, "error": "Pool not initialized"}), 500
+    data = flask_request.get_json(force=True) or {}
+    lease_ids = data.get("lease_ids")
+    if not isinstance(lease_ids, list) or not lease_ids:
+        return jsonify({"ok": False, "error": "lease_ids must be a non-empty list"}), 400
+    try:
+        return jsonify(POOL.stats_batch([str(item) for item in lease_ids]))
+    except Exception as e:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(e),
+                "error_code": "stats_batch_unavailable",
+                "retryable": False,
             }
         )
 
@@ -996,6 +1126,7 @@ def checkpoint_create():
             policy=str(data.get("policy", "")),
             reason=str(data.get("reason", "manual")),
             parent_checkpoint_id=data.get("parent_checkpoint_id"),
+            fault_injection_spec=data.get("fault_injection_spec"),
         )
         return jsonify(result)
     except Exception as e:
