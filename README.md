@@ -1,6 +1,10 @@
 # Belayer
 
+[English](README_EN.md) | 中文
+
 > 面向 LLM 强化学习与 Agentic RL 的分层容错系统
+
+**运行环境**：slime 官方镜像 `slime/slime:v0.2.2`。
 
 Belayer 构建在 [slime](slime/)、[SGLang](sglang/)、[Megatron-LM](Megatron-LM/) 和远程 Docker SWE 环境之上，目标是在长时间、多轮、异构的 LLM RL rollout 中，缩小故障影响范围并减少重复计算。系统不把所有问题都交给“整作业重启”，而是在最接近故障的位置分别处理环境状态、资源压力和推理服务中断。
 
@@ -85,7 +89,7 @@ Env checkpoint 以单个 SWE lease 为单位，并提供两个可共存 backend�
 
 checkpoint 只在安全 action 边界创建：上一条 `docker exec` 已完成，下一步 LLM generation 已经开始。Exec server 还为同一容器提供 shared exec gate 和 exclusive checkpoint/rerun gate，避免 commit 与前台命令交叉。已经排队的 exec 优先于 checkpoint，降低 checkpoint 阻塞正常环境执行的概率。
 
-Docker-managed checkpoint 会先停止 source。Belayer 在仍持有同一个 container exclusive gate 时立刻对 source ID 做一次原地 `full_resume`，验证 Docker ID 未变化、容器重新 running 且保留 `docker exec`，最后才把 record 标为 `ready`。因此 full backend 能保存 PID、Python 对象、执行中进程和后台 service；legacy backend 仍只保存文件系统与最小 runtime contract。两者都不保存 Docker volume、bind mount、宿主机文件或外部系统副作用。
+Docker-managed checkpoint 会先停止 source。Belayer 在仍持有同一个 container exclusive gate 时立刻对 source ID 做一次原地 `full_resume`，验证 Docker ID 未变化、容器重新 running 且保留 `docker exec`，最后才把 record 标为 `ready`。因此 full backend 能保存容器 init 及其 process tree 的 PID、内存中的 Python 对象和运行进度；当前不能假设它会恢复独立通过 `docker exec -d` 启动的后台 service。legacy backend 仍只保存文件系统与最小 runtime contract。两者都不保存 Docker volume、bind mount、宿主机文件或外部系统副作用。
 
 ### 3.2 创建路径与 LLM bubble overlap
 
@@ -425,7 +429,7 @@ Instant restart 与 router：
 - [`slime/scripts/fault_tolerance/`](slime/scripts/fault_tolerance/)
 - [`sglang/test/manual/test_shadow_worker_handover.py`](sglang/test/manual/test_shadow_worker_handover.py)
 
-当前仓库存在一定的测试漂移：部分 checkpoint tests 仍期待已废弃的 status/ready-delay 语义，scheduler fixtures 仍传入已删除的静态 budget 字段，fast-restart tests 也有若干 mock 与当前 health API 不一致。因此这些文件代表了已有覆盖意图和实验入口，但不能把整个测试目录当前全绿作为既成事实。
+当前仓库存在一定的测试漂移：scheduler fixtures 仍传入已删除的静态 budget 字段，fast-restart tests 也有若干 mock 与当前 health API 不一致。因此这些文件代表了已有覆盖意图和实验入口，但不能把整个测试目录当前全绿作为既成事实。
 
 ## 10. 当前容错边界
 
