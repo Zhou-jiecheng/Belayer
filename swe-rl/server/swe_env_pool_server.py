@@ -30,6 +30,9 @@ from flask import Flask, jsonify, request as flask_request
 logger = logging.getLogger("swe.env_pool_server")
 app = Flask(__name__)
 CHECKPOINT_PROBE_TIMEOUT_SEC = 5
+CHECKPOINT_CREATE_FORWARD_TIMEOUT_SEC = int(
+    os.getenv("SWE_CHECKPOINT_CREATE_FORWARD_TIMEOUT_SEC", "600")
+)
 
 
 def _post_exec(url: str, payload: dict, timeout: int = 300) -> dict:
@@ -81,6 +84,7 @@ class Lease:
     last_rerun_at: float | None = None
     created_at: float = field(default_factory=time.time)
     last_heartbeat: float = field(default_factory=time.time)
+    lifecycle_lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
 
 class SweEnvPool:
@@ -198,6 +202,7 @@ class SweEnvPool:
         latest = max(
             ready,
             key=lambda item: (
+                int(item.get("generation", 0) or 0),
                 -1 if item.get("step_idx", -1) is None else int(item.get("step_idx", -1)),
                 float(item.get("created_at", 0.0) or 0.0),
             ),
@@ -331,11 +336,15 @@ class SweEnvPool:
             lease = self._leases.get(lease_id)
         if lease is None:
             return
-        _post_exec(f"{lease.node_url}/container/destroy", {
-            "container_id": lease.container_id,
-        }, timeout=300)
-        with self._lock:
-            removed = self._leases.pop(lease_id, None)
+        with lease.lifecycle_lock:
+            with self._lock:
+                if self._leases.get(lease_id) is not lease:
+                    return
+            _post_exec(f"{lease.node_url}/container/destroy", {
+                "container_id": lease.container_id,
+            }, timeout=300)
+            with self._lock:
+                removed = self._leases.pop(lease_id, None)
         if removed is None:
             return
         node = self._find_node(removed.node_url)
@@ -382,8 +391,40 @@ class SweEnvPool:
         reason: str = "manual",
         parent_checkpoint_id: str | None = None,
         fault_injection_spec: dict[str, Any] | None = None,
+        checkpoint_backend: str | None = None,
     ) -> dict[str, Any]:
         lease = self._get_lease(lease_id)
+        with lease.lifecycle_lock:
+            if self._get_lease(lease_id) is not lease:
+                raise RuntimeError(f"Lease changed while checkpointing: {lease_id}")
+            return self._checkpoint_create_locked(
+                lease,
+                step_idx=step_idx,
+                command_seq=command_seq,
+                cwd=cwd,
+                env=env,
+                policy=policy,
+                reason=reason,
+                parent_checkpoint_id=parent_checkpoint_id,
+                fault_injection_spec=fault_injection_spec,
+                checkpoint_backend=checkpoint_backend,
+            )
+
+    def _checkpoint_create_locked(
+        self,
+        lease: Lease,
+        *,
+        step_idx: int,
+        command_seq: int,
+        cwd: str | None,
+        env: dict[str, Any] | None,
+        policy: str,
+        reason: str,
+        parent_checkpoint_id: str | None,
+        fault_injection_spec: dict[str, Any] | None,
+        checkpoint_backend: str | None,
+    ) -> dict[str, Any]:
+        lease_id = lease.lease_id
         lease.last_heartbeat = time.time()
         effective_cwd = cwd or lease.cwd
         payload = {
@@ -402,9 +443,15 @@ class SweEnvPool:
             payload["env"] = env
         if fault_injection_spec:
             payload["fault_injection_spec"] = dict(fault_injection_spec)
+        if checkpoint_backend:
+            payload["checkpoint_backend"] = checkpoint_backend
         started_perf = time.perf_counter()
         try:
-            result = _post_exec(f"{lease.node_url}/container/checkpoint/create", payload, timeout=30)
+            result = _post_exec(
+                f"{lease.node_url}/container/checkpoint/create",
+                payload,
+                timeout=CHECKPOINT_CREATE_FORWARD_TIMEOUT_SEC,
+            )
         except Exception as exc:
             logger.warning(
                 "checkpoint_create forward failed lease_id=%s container_id=%s node_url=%s step_idx=%s command_seq=%s policy=%s elapsed_sec=%.3f error=%s",
@@ -434,6 +481,19 @@ class SweEnvPool:
             result.get("checkpoint_id"),
             result.get("op_id"),
         )
+        if result.get("ok", False) and result.get("status") == "ready":
+            result_container_id = str(result.get("container_id", "") or "")
+            result_generation = int(result.get("generation", lease.generation) or 0)
+            with self._lock:
+                current = self._leases.get(lease_id)
+                if (
+                    current is lease
+                    and (not result_container_id or current.container_id == result_container_id)
+                    and current.generation == result_generation
+                ):
+                    checkpoint_step = int(result.get("step_idx", -1) or -1)
+                    current.latest_ready_checkpoint_id = str(result["checkpoint_id"])
+                    current.latest_checkpoint_step_idx = checkpoint_step
         return result
 
     def checkpoint_status(self, lease_id: str, checkpoint_id: str) -> dict[str, Any]:
@@ -589,9 +649,28 @@ class SweEnvPool:
         *,
         checkpoint_id: str | None = None,
         cwd: str | None = None,
-        timeout: int = 120,
+        timeout: int = 300,
     ) -> dict[str, Any]:
         lease = self._get_lease(lease_id)
+        with lease.lifecycle_lock:
+            if self._get_lease(lease_id) is not lease:
+                raise RuntimeError(f"Lease changed while rerunning: {lease_id}")
+            return self._rerun_locked(
+                lease,
+                checkpoint_id=checkpoint_id,
+                cwd=cwd,
+                timeout=timeout,
+            )
+
+    def _rerun_locked(
+        self,
+        lease: Lease,
+        *,
+        checkpoint_id: str | None,
+        cwd: str | None,
+        timeout: int,
+    ) -> dict[str, Any]:
+        lease_id = lease.lease_id
         target_checkpoint_id = checkpoint_id or lease.latest_ready_checkpoint_id
         if not target_checkpoint_id:
             raise RuntimeError(f"No ready checkpoint available for lease {lease_id}")
@@ -600,6 +679,7 @@ class SweEnvPool:
             f"{lease.node_url}/container/rerun",
             {
                 "checkpoint_id": target_checkpoint_id,
+                "lease_id": lease.lease_id,
                 "old_container_id": lease.container_id,
                 "cwd": effective_cwd,
                 "timeout": int(timeout),
@@ -612,10 +692,14 @@ class SweEnvPool:
             lease.generation += 1
             lease.rerun_count += 1
             lease.last_rerun_at = time.time()
-            checkpoint_image = str(result.get("checkpoint_image", "")).strip()
+            checkpoint_image = str(result.get("checkpoint_image") or "").strip()
+            restored_image = str(result.get("restored_image") or "").strip()
             if lease.base_image is None:
                 lease.base_image = lease.image
-            if checkpoint_image:
+            if restored_image:
+                lease.image = restored_image
+                lease.current_image = restored_image
+            elif checkpoint_image:
                 lease.image = checkpoint_image
                 lease.current_image = checkpoint_image
         return result
@@ -1127,6 +1211,7 @@ def checkpoint_create():
             reason=str(data.get("reason", "manual")),
             parent_checkpoint_id=data.get("parent_checkpoint_id"),
             fault_injection_spec=data.get("fault_injection_spec"),
+            checkpoint_backend=data.get("checkpoint_backend"),
         )
         return jsonify(result)
     except Exception as e:
@@ -1219,7 +1304,7 @@ def rerun():
             lease_id=lease_id,
             checkpoint_id=data.get("checkpoint_id"),
             cwd=data.get("cwd"),
-            timeout=int(data.get("timeout", 120)),
+            timeout=int(data.get("timeout", 300)),
         )
         return jsonify(result)
     except Exception as e:

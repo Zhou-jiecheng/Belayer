@@ -1,0 +1,3 @@
+[submodule "docker-full-checkpoint"]
+	path = docker-full-checkpoint
+	url = https://github.com/Zhou-jiecheng/docker-full-checkpoint.git

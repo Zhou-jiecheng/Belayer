@@ -160,6 +160,24 @@ class TestSweEnvClientRetry(unittest.IsolatedAsyncioTestCase):
             {"phase": "before_commit", "delay_sec": 0.25},
         )
 
+    async def test_checkpoint_create_forwards_backend_and_uses_full_http_timeout(self):
+        client = SweEnvClient(base_url="http://fake")
+        client.checkpoint_create_timeout_sec = 432.0
+
+        async def fake_once(path, payload, timeout=30.0, use_slime=True):
+            del use_slime
+            self.assertEqual(path, "checkpoint/create")
+            self.assertEqual(payload["checkpoint_backend"], "legacy")
+            self.assertEqual(timeout, 432.0)
+            return {"ok": True, "checkpoint_id": "ckpt-legacy"}
+
+        with patch.object(client, "_post_once", new=fake_once):
+            out = await client.checkpoint_create(
+                "lease-1", checkpoint_backend="legacy"
+            )
+
+        self.assertTrue(out["ok"])
+
     async def test_exec_payload_with_fault_injection_spec(self):
         seen: list[tuple[str, dict]] = []
 

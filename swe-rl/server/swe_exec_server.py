@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import logging
 import os
@@ -27,7 +28,9 @@ import queue
 import random
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -574,7 +577,13 @@ class ExecServerConfig:
     pool_resource_stats_dir: str = ""
     checkpoint_enabled: bool = True
     checkpoint_dir: str = "/tmp/swe-checkpoints"
+    checkpoint_backend: str = "full"
     checkpoint_create_timeout_sec: int = 15
+    full_checkpoint_project_root: str = ""
+    full_checkpoint_state_root: str = ""
+    full_checkpoint_docker_root: str = ""
+    full_checkpoint_runtime_staging_root: str = "/dev/shm/docker-full-checkpoint"
+    full_checkpoint_criu_timeout_sec: int = 120
     checkpoint_timeout_cooldown_sec: float = 60.0
     checkpoint_min_ready_latency_sec: float = 2.0
     checkpoint_max_inflight: int = 12
@@ -674,10 +683,40 @@ class ExecServerConfig:
                 "checkpoint_dir",
                 cls.checkpoint_dir,
             ),
+            checkpoint_backend=_read_str(
+                "SWE_CHECKPOINT_BACKEND",
+                "checkpoint_backend",
+                cls.checkpoint_backend,
+            ),
             checkpoint_create_timeout_sec=_read_int(
                 "SWE_CHECKPOINT_CREATE_TIMEOUT_SEC",
                 "checkpoint_create_timeout_sec",
                 cls.checkpoint_create_timeout_sec,
+            ),
+            full_checkpoint_project_root=_read_str(
+                "SWE_FULL_CHECKPOINT_PROJECT_ROOT",
+                "full_checkpoint_project_root",
+                cls.full_checkpoint_project_root,
+            ),
+            full_checkpoint_state_root=_read_str(
+                "SWE_FULL_CHECKPOINT_STATE_ROOT",
+                "full_checkpoint_state_root",
+                cls.full_checkpoint_state_root,
+            ),
+            full_checkpoint_docker_root=_read_str(
+                "SWE_FULL_CHECKPOINT_DOCKER_ROOT",
+                "full_checkpoint_docker_root",
+                cls.full_checkpoint_docker_root,
+            ),
+            full_checkpoint_runtime_staging_root=_read_str(
+                "SWE_FULL_CHECKPOINT_RUNTIME_STAGING_ROOT",
+                "full_checkpoint_runtime_staging_root",
+                cls.full_checkpoint_runtime_staging_root,
+            ),
+            full_checkpoint_criu_timeout_sec=_read_int(
+                "SWE_FULL_CHECKPOINT_CRIU_TIMEOUT_SEC",
+                "full_checkpoint_criu_timeout_sec",
+                cls.full_checkpoint_criu_timeout_sec,
             ),
             checkpoint_timeout_cooldown_sec=_read_float(
                 "SWE_CHECKPOINT_TIMEOUT_COOLDOWN_SEC",
@@ -883,6 +922,7 @@ class CheckpointManager:
         policy: str,
         reason: str,
         parent_checkpoint_id: str | None,
+        checkpoint_backend: str = "legacy",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         record, op, _ = self.create_checkpoint_with_stats(
             lease_id=lease_id,
@@ -896,6 +936,7 @@ class CheckpointManager:
             policy=policy,
             reason=reason,
             parent_checkpoint_id=parent_checkpoint_id,
+            checkpoint_backend=checkpoint_backend,
         )
         return record, op
 
@@ -913,20 +954,25 @@ class CheckpointManager:
         policy: str,
         reason: str,
         parent_checkpoint_id: str | None,
+        checkpoint_backend: str = "legacy",
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         checkpoint_id = f"swe-ckpt-{uuid.uuid4().hex[:16]}"
         op_id = f"swe-ckpt-op-{uuid.uuid4().hex[:16]}"
         image_tag = _checkpoint_image_tag(checkpoint_id)
+        checkpoint_backend = _normalize_checkpoint_backend(
+            checkpoint_backend, default="legacy"
+        )
         now = time.time()
         record = {
             "checkpoint_id": checkpoint_id,
+            "checkpoint_backend": checkpoint_backend,
             "lease_id": lease_id,
             "generation": int(generation),
             "container_id": container_id,
             "instance_id": instance_id,
             "image": image,
             "cwd": cwd,
-            "checkpoint_image": image_tag,
+            "checkpoint_image": image_tag if checkpoint_backend == "legacy" else None,
             "parent_checkpoint_id": parent_checkpoint_id,
             "step_idx": int(step_idx),
             "command_seq": int(command_seq),
@@ -996,7 +1042,7 @@ class CheckpointManager:
             records = list(self._checkpoints.values())
         if lease_id is not None:
             records = [item for item in records if item.get("lease_id") == lease_id]
-        records.sort(key=lambda item: (float(item.get("step_idx", -1)), float(item.get("created_at", 0.0))))
+        records.sort(key=_checkpoint_sort_key)
         return [dict(item) for item in records]
 
     def latest_ready_checkpoint(self, lease_id: str) -> dict[str, Any] | None:
@@ -2003,9 +2049,7 @@ def _is_valid_git_patch(patch_text: str) -> bool:
     return has_old and has_new
 
 
-def _docker_create_container(image: str, cwd: str, timeout: int, *, container_name: str | None = None) -> dict[str, Any]:
-    container_name = container_name or f"swe-{uuid.uuid4().hex[:12]}"
-    started_at = time.time()
+def _docker_proxy_env_args() -> list[str]:
     proxy_args: list[str] = []
     for env_name in (
         "HTTP_PROXY",
@@ -2020,16 +2064,30 @@ def _docker_create_container(image: str, cwd: str, timeout: int, *, container_na
         env_value = os.getenv(env_name, "").strip()
         if env_value:
             proxy_args.extend(["-e", f"{env_name}={env_value}"])
-    r = _docker(
-        "run", "-d",
+    return proxy_args
+
+
+def _docker_container_create_args(
+    *, image: str, cwd: str, container_name: str
+) -> list[str]:
+    return [
         "--name", container_name,
         "--network", "host",
-        *proxy_args,
+        *_docker_proxy_env_args(),
         "-w", cwd,
         "--pids-limit", "256",
         "--memory", "4g",
         image,
         "sleep", "infinity",
+    ]
+
+
+def _docker_create_container(image: str, cwd: str, timeout: int, *, container_name: str | None = None) -> dict[str, Any]:
+    container_name = container_name or f"swe-{uuid.uuid4().hex[:12]}"
+    started_at = time.time()
+    r = _docker(
+        "run", "-d",
+        *_docker_container_create_args(image=image, cwd=cwd, container_name=container_name),
         timeout=timeout,
     )
     elapsed = time.time() - started_at
@@ -2058,9 +2116,176 @@ def _checkpoint_image_tag(checkpoint_id: str) -> str:
     return f"sweckpt:{safe}"
 
 
-def _checkpoint_sort_key(item: dict[str, Any]) -> tuple[int, float]:
+@dataclass(frozen=True)
+class _FullCheckpointApi:
+    checkpoint_options: Any
+    resume_options: Any
+    full_checkpoint: Any
+    full_resume: Any
+
+
+_full_checkpoint_api_lock = threading.Lock()
+_full_checkpoint_api_cache: _FullCheckpointApi | None = None
+_full_checkpoint_docker_root_lock = threading.Lock()
+_full_checkpoint_docker_root_cache: Path | None = None
+
+
+def _normalize_checkpoint_backend(value: Any, *, default: str = "full") -> str:
+    backend = str(value or default).strip().lower().replace("-", "_")
+    aliases = {
+        "full": "full",
+        "full_checkpoint": "full",
+        "legacy": "legacy",
+        "commit": "legacy",
+        "docker_commit": "legacy",
+    }
+    normalized = aliases.get(backend)
+    if normalized is None:
+        raise ValueError(
+            f"unsupported checkpoint backend {value!r}; expected 'full' or 'legacy'"
+        )
+    return normalized
+
+
+def _record_checkpoint_backend(record: dict[str, Any]) -> str:
+    # Records created before the full-checkpoint integration have no backend
+    # marker and must keep using their docker-commit image.
+    return _normalize_checkpoint_backend(record.get("checkpoint_backend"), default="legacy")
+
+
+def _full_checkpoint_state_root(record: dict[str, Any] | None = None) -> Path:
+    recorded = str((record or {}).get("full_checkpoint_state_root", "") or "").strip()
+    configured = str(_SERVER_CONFIG.full_checkpoint_state_root or "").strip()
+    return Path(recorded or configured or (Path(_SERVER_CONFIG.checkpoint_dir) / "full-checkpoint-state"))
+
+
+def _full_checkpoint_project_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    configured = str(_SERVER_CONFIG.full_checkpoint_project_root or "").strip()
+    if configured:
+        candidates.append(Path(configured))
+    server_path = Path(__file__).resolve()
+    if len(server_path.parents) > 2:
+        candidates.append(server_path.parents[2] / "docker-full-checkpoint")
+    if len(server_path.parents) > 3:
+        candidates.append(server_path.parents[3] / "docker-full-checkpoint")
+    candidates.extend(
+        [
+            Path.cwd() / "docker-full-checkpoint",
+            Path("/opt/docker-full-checkpoint"),
+        ]
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def _load_full_checkpoint_api() -> _FullCheckpointApi:
+    global _full_checkpoint_api_cache
+    with _full_checkpoint_api_lock:
+        if _full_checkpoint_api_cache is not None:
+            return _full_checkpoint_api_cache
+
+        import_error: Exception | None = None
+        for source_root in [None, *[path / "src" for path in _full_checkpoint_project_candidates()]]:
+            if source_root is not None:
+                if not (source_root / "full_checkpoint").is_dir():
+                    continue
+                source_text = str(source_root)
+                if source_text not in sys.path:
+                    sys.path.insert(0, source_text)
+            try:
+                checkpoint_module = importlib.import_module("full_checkpoint.checkpoint")
+                resume_module = importlib.import_module("full_checkpoint.resume")
+                _full_checkpoint_api_cache = _FullCheckpointApi(
+                    checkpoint_options=checkpoint_module.CheckpointOptions,
+                    resume_options=resume_module.ResumeOptions,
+                    full_checkpoint=checkpoint_module.full_checkpoint,
+                    full_resume=resume_module.full_resume,
+                )
+                return _full_checkpoint_api_cache
+            except (ImportError, AttributeError) as exc:
+                import_error = exc
+
+        searched = ", ".join(str(path) for path in _full_checkpoint_project_candidates())
+        raise RuntimeError(
+            "docker-full-checkpoint is unavailable; install the package or set "
+            f"SWE_FULL_CHECKPOINT_PROJECT_ROOT (searched: {searched})"
+        ) from import_error
+
+
+def _full_checkpoint_docker_root() -> Path:
+    global _full_checkpoint_docker_root_cache
+    configured = str(_SERVER_CONFIG.full_checkpoint_docker_root or "").strip()
+    if configured:
+        return Path(configured)
+    with _full_checkpoint_docker_root_lock:
+        if _full_checkpoint_docker_root_cache is not None:
+            return _full_checkpoint_docker_root_cache
+        result = _docker("info", "--format", "{{.DockerRootDir}}", timeout=10)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(
+                result.stderr.strip() or "docker info did not report DockerRootDir"
+            )
+        _full_checkpoint_docker_root_cache = Path(result.stdout.strip())
+        return _full_checkpoint_docker_root_cache
+
+
+def _full_checkpoint_artifact_dir(checkpoint_id: str, record: dict[str, Any] | None = None) -> Path:
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(checkpoint_id))
+    return _full_checkpoint_state_root(record) / "checkpoints" / safe_id
+
+
+def _directory_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for root, _, files in os.walk(path, followlinks=False):
+        for filename in files:
+            try:
+                total += (Path(root) / filename).lstat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _remove_installed_docker_checkpoint(
+    *, docker_root: Path, container_id: str, checkpoint_id: str
+) -> None:
+    if not container_id:
+        return
+    result = _docker(
+        "checkpoint", "rm", container_id, checkpoint_id, timeout=60
+    )
+    if result.returncode == 0:
+        return
+    installed = docker_root / "containers" / container_id / "checkpoints" / checkpoint_id
+    if installed.exists():
+        # Fallback for daemon versions that refuse checkpoint rm after start.
+        # This server already requires root access for docker-full-checkpoint.
+        shutil.rmtree(installed)
+
+
+def _delete_checkpoint_artifacts(record: dict[str, Any]) -> None:
+    if _record_checkpoint_backend(record) == "legacy":
+        image_name = str(record.get("checkpoint_image", "") or "")
+        if image_name:
+            _docker("image", "rm", "-f", image_name, timeout=60)
+        return
+    artifact_dir = _full_checkpoint_artifact_dir(str(record["checkpoint_id"]), record)
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+
+
+def _checkpoint_sort_key(item: dict[str, Any]) -> tuple[int, int, float]:
     raw_step_idx = item.get("step_idx", -1)
     return (
+        int(item.get("generation", 0) or 0),
         -1 if raw_step_idx is None else int(raw_step_idx),
         float(item.get("created_at", 0.0) or 0.0),
     )
@@ -2745,6 +2970,275 @@ def _checkpoint_probe_state(container_id: str | None = None) -> dict[str, Any]:
     }
 
 
+@contextlib.contextmanager
+def _full_checkpoint_source_guard(
+    *,
+    container_id: str,
+    checkpoint_id: str,
+    docker_root: Path,
+    recovery_state: dict[str, Any],
+) -> Any:
+    """Keep the container gate held while recovering a stopped source."""
+    with _container_exclusive_section(container_id):
+        try:
+            yield
+        except Exception:
+            if _container_is_active(container_id):
+                try:
+                    if not _docker_container_is_running(container_id, timeout=10):
+                        recovery_state["attempted"] = True
+                        result = _docker("start", container_id, timeout=120)
+                        if result.returncode != 0:
+                            raise RuntimeError(
+                                result.stderr.strip()
+                                or f"docker start failed for {container_id}"
+                            )
+                        recovery_state["succeeded"] = _docker_container_is_running(
+                            container_id, timeout=10
+                        )
+                        recovery_state["mode"] = "plain_restart"
+                except Exception:
+                    logger.exception(
+                        "Failed to recover source after full checkpoint error "
+                        "checkpoint_id=%s container_id=%s",
+                        checkpoint_id,
+                        container_id,
+                    )
+                if recovery_state.get("attempted"):
+                    try:
+                        _remove_installed_docker_checkpoint(
+                            docker_root=docker_root,
+                            container_id=container_id,
+                            checkpoint_id=checkpoint_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean installed checkpoint after source recovery: %s",
+                            checkpoint_id,
+                            exc_info=True,
+                        )
+            raise
+
+
+def _full_checkpoint_create_worker(
+    *,
+    op_id: str,
+    checkpoint_id: str,
+    container_id: str,
+    record: dict[str, Any],
+    fault_injection_spec: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Create a durable CRIU+upperdir checkpoint and transparently resume source."""
+    started_at = time.time()
+    started_perf = time.perf_counter()
+    source_resumed = False
+    source_recovery: dict[str, Any] = {
+        "attempted": False,
+        "succeeded": False,
+        "mode": "none",
+    }
+    fault_spec = dict(fault_injection_spec or {})
+    state_root = _full_checkpoint_state_root(record)
+    state_root.mkdir(parents=True, exist_ok=True)
+    docker_root = _full_checkpoint_docker_root()
+    runtime_staging = str(_SERVER_CONFIG.full_checkpoint_runtime_staging_root or "").strip()
+    api = _load_full_checkpoint_api()
+    manifest: dict[str, Any] = {}
+    resume_result: dict[str, Any] = {}
+    full_checkpoint_sec = 0.0
+    source_resume_sec = 0.0
+    exclusive_wait_started = time.perf_counter()
+
+    try:
+        with _full_checkpoint_source_guard(
+            container_id=container_id,
+            checkpoint_id=checkpoint_id,
+            docker_root=docker_root,
+            recovery_state=source_recovery,
+        ):
+            exclusive_wait_sec = time.perf_counter() - exclusive_wait_started
+            if not _container_is_active(container_id) or not _docker_container_is_running(container_id, timeout=10):
+                raise RuntimeError(
+                    f"container no longer active before full checkpoint: {container_id}"
+                )
+
+            if fault_spec.get("phase") == "before_commit":
+                fault_delay_sec = float(fault_spec.get("delay_sec", 0.0) or 0.0)
+                if fault_delay_sec > 0.0:
+                    time.sleep(fault_delay_sec)
+                fault_event = _inject_fail_stop_fault(
+                    container_id,
+                    fault_type="checkpoint_explicit_before_full_checkpoint_kill",
+                    fault_phase="before_commit",
+                    delay_sec=fault_delay_sec,
+                    tag=str(fault_spec.get("tag", "") or ""),
+                    remove_tracking=True,
+                    drop_gate=True,
+                )
+                _CHECKPOINTS.update_checkpoint(checkpoint_id, **fault_event)
+                raise RuntimeError("injected checkpoint fault before full checkpoint")
+
+            with _commit_docker_section():
+                checkpoint_started = time.perf_counter()
+                manifest = api.full_checkpoint(
+                    container_id,
+                    options=api.checkpoint_options(
+                        checkpoint_id=checkpoint_id,
+                        state_root=state_root,
+                        docker_root=docker_root,
+                        require_criu=True,
+                        leave_running=False,
+                        criu_timeout_sec=max(
+                            1, int(_SERVER_CONFIG.full_checkpoint_criu_timeout_sec)
+                        ),
+                        docker_managed=True,
+                        runtime_staging_root=Path(runtime_staging) if runtime_staging else None,
+                    ),
+                )
+                full_checkpoint_sec = time.perf_counter() - checkpoint_started
+                if fault_spec.get("phase") == "after_commit_before_ready":
+                    fault_delay_sec = float(fault_spec.get("delay_sec", 0.0) or 0.0)
+                    if fault_delay_sec > 0.0:
+                        time.sleep(fault_delay_sec)
+                    fault_event = _inject_fail_stop_fault(
+                        container_id,
+                        fault_type="checkpoint_explicit_after_full_checkpoint_before_ready_kill",
+                        fault_phase="after_commit_before_ready",
+                        delay_sec=fault_delay_sec,
+                        tag=str(fault_spec.get("tag", "") or ""),
+                        remove_tracking=True,
+                        drop_gate=True,
+                    )
+                    _CHECKPOINTS.update_checkpoint(checkpoint_id, **fault_event)
+                    raise RuntimeError(
+                        "injected checkpoint fault after full checkpoint before ready"
+                    )
+
+                # Docker-managed checkpoint stops the source. Restore into the
+                # same Docker container before releasing the exclusive gate so
+                # rollout observes one coherent pause and keeps the same ID.
+                resume_started = time.perf_counter()
+                resume_result = api.full_resume(
+                    checkpoint_id,
+                    options=api.resume_options(
+                        state_root=state_root,
+                        container_id=container_id,
+                        keep_failed=True,
+                        criu_timeout_sec=max(
+                            1, int(_SERVER_CONFIG.full_checkpoint_criu_timeout_sec)
+                        ),
+                        docker_managed=True,
+                        docker_root=docker_root,
+                    ),
+                )
+                source_resume_sec = time.perf_counter() - resume_started
+                source_docker_id = str(resume_result.get("docker_container_id", "") or "")
+                if not bool(resume_result.get("docker_exec_supported", False)):
+                    raise RuntimeError("full resume did not preserve Docker exec support")
+                if source_docker_id and not (
+                    source_docker_id.startswith(container_id) or container_id.startswith(source_docker_id)
+                ):
+                    raise RuntimeError(
+                        "in-place full resume returned a different Docker container: "
+                        f"expected={container_id} actual={source_docker_id}"
+                    )
+                if not _docker_container_is_running(container_id, timeout=10):
+                    raise RuntimeError(
+                        f"source container is not running after in-place full resume: {container_id}"
+                    )
+                source_resumed = True
+                try:
+                    _remove_installed_docker_checkpoint(
+                        docker_root=docker_root,
+                        container_id=source_docker_id or container_id,
+                        checkpoint_id=checkpoint_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Full checkpoint is ready but installed-copy cleanup failed: %s",
+                        checkpoint_id,
+                        exc_info=True,
+                    )
+
+        ready_at = time.time()
+        artifact_dir = _full_checkpoint_artifact_dir(checkpoint_id, record)
+        artifact_size = _directory_size_bytes(artifact_dir)
+        total_sec = time.perf_counter() - started_perf
+        updated, _ = _CHECKPOINTS.update_checkpoint_with_stats(
+            checkpoint_id,
+            checkpoint_backend="full",
+            checkpoint_image=None,
+            status="ready",
+            ready_at=ready_at,
+            failed_at=None,
+            error=None,
+            full_checkpoint_state_root=str(state_root),
+            full_checkpoint_artifact_dir=str(artifact_dir),
+            full_checkpoint_manifest=str(artifact_dir / "manifest.json"),
+            full_checkpoint_timings_sec=dict(manifest.get("timings_sec", {}) or {}),
+            full_checkpoint_create_sec=full_checkpoint_sec,
+            full_checkpoint_source_resume_sec=source_resume_sec,
+            raw_create_latency_sec=ready_at - started_at,
+            ready_latency_sec=ready_at - started_at,
+            ready_delay_sec=0.0,
+            size_bytes=artifact_size,
+            source_resumed=True,
+            container_usable=True,
+            state_continuity=True,
+            source_recovery_mode="full_resume",
+        )
+        _CHECKPOINTS.update_op(
+            op_id,
+            status="ready",
+            finished_at=ready_at,
+            error=None,
+        )
+        updated.update(
+            {
+                "build_payload_sec": 0.0,
+                "runtime_probe_sec": 0.0,
+                "runtime_payload_build_sec": 0.0,
+                "runtime_state_write_sec": 0.0,
+                "post_commit_finalize_sec": max(
+                    0.0, total_sec - full_checkpoint_sec - source_resume_sec
+                ),
+                "full_checkpoint_total_sec": total_sec,
+                "exclusive_wait_sec": exclusive_wait_sec,
+            }
+        )
+        logger.info(
+            "full checkpoint ready checkpoint_id=%s container_id=%s "
+            "checkpoint_sec=%.3f source_resume_sec=%.3f total_sec=%.3f size_bytes=%s",
+            checkpoint_id,
+            container_id,
+            full_checkpoint_sec,
+            source_resume_sec,
+            total_sec,
+            artifact_size,
+        )
+        return updated
+    except Exception:
+        try:
+            _CHECKPOINTS.update_checkpoint(
+                checkpoint_id,
+                source_resumed=source_resumed,
+                source_recovery_attempted=source_recovery["attempted"],
+                source_recovery_succeeded=source_recovery["succeeded"],
+                source_recovery_mode=source_recovery["mode"],
+                state_continuity=not source_recovery["attempted"],
+                container_usable=(
+                    not source_recovery["attempted"]
+                    and _container_is_active(container_id)
+                    and _docker_container_is_running(container_id, timeout=10)
+                ),
+                full_checkpoint_create_sec=full_checkpoint_sec,
+                full_checkpoint_source_resume_sec=source_resume_sec,
+            )
+        except Exception:
+            logger.exception("Failed to persist full checkpoint recovery state: %s", checkpoint_id)
+        raise
+
+
 def _checkpoint_create_worker(
     op_id: str,
     checkpoint_id: str,
@@ -2776,6 +3270,14 @@ def _checkpoint_create_worker(
     if not record.get("checkpoint_id"):
         record = dict(_CHECKPOINTS.get_checkpoint(checkpoint_id) or record)
     try:
+        if _record_checkpoint_backend(record) == "full":
+            return _full_checkpoint_create_worker(
+                op_id=op_id,
+                checkpoint_id=checkpoint_id,
+                container_id=container_id,
+                record=record,
+                fault_injection_spec=fault_injection_spec,
+            )
         started_at = time.time()
         logger.info(
             "checkpoint worker start checkpoint_id=%s container_id=%s image=%s",
@@ -2988,17 +3490,29 @@ def _checkpoint_create_worker(
             return final_record
 
         raw_create_latency_sec = finished_at - started_at
-        ready_at = finished_at
+        image_size_started_perf = time.perf_counter()
+        size_bytes = _docker_image_size_bytes(checkpoint_image)
+        image_size_sec = time.perf_counter() - image_size_started_perf
+        ready_delay_sec = max(
+            0.0,
+            float(_SERVER_CONFIG.checkpoint_min_ready_latency_sec)
+            - raw_create_latency_sec,
+        )
+        if ready_delay_sec > 0.0:
+            time.sleep(ready_delay_sec)
+            ready_at = time.time()
+        else:
+            ready_at = finished_at
         post_commit_finalize_started_perf = time.perf_counter()
         _, checkpoint_stats = _CHECKPOINTS.update_checkpoint_with_stats(
             checkpoint_id,
             status="ready",
             ready_at=ready_at,
-            size_bytes=None,
+            size_bytes=size_bytes,
             error=None,
             raw_create_latency_sec=raw_create_latency_sec,
-            ready_latency_sec=raw_create_latency_sec,
-            ready_delay_sec=0.0,
+            ready_latency_sec=ready_at - started_at,
+            ready_delay_sec=ready_delay_sec,
         )
         _, op_stats = _CHECKPOINTS.update_op_with_stats(
             op_id,
@@ -3051,7 +3565,7 @@ def _checkpoint_create_worker(
             known_worker_sec,
             unaccounted_worker_sec,
             total_worker_sec,
-            None,
+            size_bytes,
         )
         return final_record
     except Exception as exc:
@@ -3127,9 +3641,7 @@ def _checkpoint_gc_worker(task_key: str, checkpoint_items: list[dict[str, Any]])
     try:
         with _maintenance_docker_section():
             for item in checkpoint_items:
-                image_name = str(item.get("checkpoint_image", ""))
-                if image_name:
-                    _docker("image", "rm", "-f", image_name, timeout=60)
+                _delete_checkpoint_artifacts(item)
                 _CHECKPOINTS.delete_checkpoint(str(item["checkpoint_id"]))
     except Exception:
         logger.exception("Asynchronous checkpoint GC worker failed for task %s", task_key)
@@ -3144,7 +3656,33 @@ def _checkpoint_gc_worker(task_key: str, checkpoint_items: list[dict[str, Any]])
 def healthz():
     r = _docker("info", "--format", "{{.ContainersRunning}}", timeout=10)
     running = r.stdout.strip() if r.returncode == 0 else "?"
-    return jsonify({"ok": True, "running_containers": running})
+    checkpoint_health: dict[str, Any] = {
+        "enabled": _SERVER_CONFIG.checkpoint_enabled,
+        "backend": _normalize_checkpoint_backend(
+            _SERVER_CONFIG.checkpoint_backend, default="full"
+        ),
+    }
+    if checkpoint_health["backend"] == "full":
+        try:
+            _load_full_checkpoint_api()
+            docker_root = _full_checkpoint_docker_root()
+            checkpoint_health.update(
+                {
+                    "api_available": True,
+                    "docker_root": str(docker_root),
+                    "docker_root_readable": os.access(
+                        docker_root / "containers", os.R_OK | os.X_OK
+                    ),
+                    "state_root": str(_full_checkpoint_state_root()),
+                }
+            )
+        except Exception as exc:
+            checkpoint_health.update({"api_available": False, "error": str(exc)})
+    return jsonify({
+        "ok": True,
+        "running_containers": running,
+        "checkpoint": checkpoint_health,
+    })
 
 
 @app.get("/images")
@@ -3614,6 +4152,18 @@ def container_checkpoint_create():
     command_seq = int(data.get("command_seq", -1))
     policy = str(data.get("policy", ""))
     reason = str(data.get("reason", "manual"))
+    parent_checkpoint_id = str(data.get("parent_checkpoint_id") or "") or None
+    try:
+        checkpoint_backend = _normalize_checkpoint_backend(
+            data.get("checkpoint_backend"),
+            default=_SERVER_CONFIG.checkpoint_backend,
+        )
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "error_code": "invalid_checkpoint_backend",
+        }), 400
     try:
         fault_injection_spec = _normalize_fault_injection_spec(
             data.get("fault_injection_spec"),
@@ -3674,6 +4224,22 @@ def container_checkpoint_create():
             time.perf_counter() - request_started_perf,
         )
         return jsonify({"ok": False, "error": f"unknown container_id: {container_id}", "error_code": "unknown_container_id"}), 404
+    if parent_checkpoint_id:
+        parent = _CHECKPOINTS.get_checkpoint(parent_checkpoint_id)
+        if parent is None:
+            return jsonify({
+                "ok": False,
+                "error": f"unknown parent checkpoint: {parent_checkpoint_id}",
+                "error_code": "checkpoint_parent_not_found",
+                "retryable": False,
+            }), 404
+        if parent.get("status") != "ready" or str(parent.get("lease_id", "")) != lease_id:
+            return jsonify({
+                "ok": False,
+                "error": "parent checkpoint must be ready and belong to the same lease",
+                "error_code": "checkpoint_parent_invalid",
+                "retryable": False,
+            }), 409
     if not _CHECKPOINTS.try_begin_create():
         logger.info(
             "checkpoint create request rejected by inflight gate lease_id=%s container_id=%s step_idx=%s command_seq=%s policy=%s handler_sec=%.3f inflight_checkpoints=%s max_inflight=%s",
@@ -3717,7 +4283,8 @@ def container_checkpoint_create():
             command_seq=command_seq,
             policy=policy,
             reason=reason,
-            parent_checkpoint_id=data.get("parent_checkpoint_id"),
+            parent_checkpoint_id=parent_checkpoint_id,
+            checkpoint_backend=checkpoint_backend,
         )
         create_persist_sec = float(create_stats.get("persist_sec", 0.0) or 0.0)
         create_metadata_bytes = int(create_stats.get("metadata_bytes", 0) or 0)
@@ -3731,12 +4298,19 @@ def container_checkpoint_create():
         )
         runtime_env = dict(persisted_runtime_env)
         runtime_env.update(request_runtime_env)
+        record = _CHECKPOINTS.update_checkpoint(
+            record["checkpoint_id"],
+            runtime_env=runtime_env,
+            full_checkpoint_state_root=(
+                str(_full_checkpoint_state_root(record)) if checkpoint_backend == "full" else None
+            ),
+        )
         worker_started_perf = time.perf_counter()
         final_record, dispatcher_queue_wait_sec, dispatcher_worker_exec_sec = _dispatch_checkpoint_create_and_wait(
             op_id=op["op_id"],
             checkpoint_id=record["checkpoint_id"],
             container_id=container_id,
-            checkpoint_image=record["checkpoint_image"],
+            checkpoint_image=str(record.get("checkpoint_image") or ""),
             record=record,
             runtime_env=runtime_env,
             fault_injection_spec=fault_injection_spec,
@@ -3833,6 +4407,10 @@ def container_checkpoint_create():
             "fault_type": final_record.get("fault_type"),
             "fault_phase": final_record.get("fault_phase"),
             "checkpoint_image": final_record.get("checkpoint_image"),
+            "checkpoint_backend": final_record.get("checkpoint_backend"),
+            "container_usable": final_record.get("container_usable"),
+            "state_continuity": final_record.get("state_continuity"),
+            "source_recovery_mode": final_record.get("source_recovery_mode"),
         })
     handler_sec = time.perf_counter() - request_started_perf
     logger.info(
@@ -3868,10 +4446,16 @@ def container_checkpoint_create():
         "checkpoint_id": final_record["checkpoint_id"],
         "op_id": op["op_id"],
         "status": final_record["status"],
-        "checkpoint_image": final_record["checkpoint_image"],
+        "checkpoint_backend": final_record.get("checkpoint_backend", "legacy"),
+        "checkpoint_image": final_record.get("checkpoint_image"),
+        "container_id": final_record.get("container_id"),
+        "generation": final_record.get("generation", 0),
         "step_idx": final_record["step_idx"],
         "ready_at": final_record["ready_at"],
         "size_bytes": final_record["size_bytes"],
+        "full_checkpoint_timings_sec": final_record.get("full_checkpoint_timings_sec"),
+        "full_checkpoint_create_sec": final_record.get("full_checkpoint_create_sec"),
+        "full_checkpoint_source_resume_sec": final_record.get("full_checkpoint_source_resume_sec"),
     })
 
 
@@ -3904,11 +4488,9 @@ def container_checkpoint_delete():
         return jsonify({"ok": False, "error": f"unknown checkpoint_id: {checkpoint_id}", "error_code": "checkpoint_not_found"}), 404
     if record.get("status") == "pending":
         return jsonify({"ok": False, "error": "checkpoint is still pending", "error_code": "checkpoint_not_ready", "retryable": True}), 409
-    image_name = str(record.get("checkpoint_image", ""))
     reclaimed = int(record.get("size_bytes") or 0)
-    if image_name:
-        with _maintenance_docker_section():
-            _docker("image", "rm", "-f", image_name, timeout=60)
+    with _maintenance_docker_section():
+        _delete_checkpoint_artifacts(record)
     _CHECKPOINTS.delete_checkpoint(str(checkpoint_id))
     return jsonify({"ok": True, "deleted": True, "reclaimed_bytes": reclaimed})
 
@@ -4007,6 +4589,132 @@ def container_checkpoint_gc_drain():
         time.sleep(min(poll_interval_sec, max(0.0, timeout_sec - waited_sec)))
 
 
+def _full_checkpoint_rerun(
+    *,
+    record: dict[str, Any],
+    old_container_id: str | None,
+    cwd: str,
+    timeout: int,
+) -> dict[str, Any]:
+    checkpoint_id = str(record["checkpoint_id"])
+    image = str(record.get("image", "") or "")
+    if not image:
+        raise RuntimeError(f"full checkpoint record has no source image: {checkpoint_id}")
+    target_name = re.sub(
+        r"[^a-zA-Z0-9_.-]+",
+        "-",
+        f"swe-resume-{checkpoint_id[-12:]}-{uuid.uuid4().hex[:8]}",
+    )
+    state_root = _full_checkpoint_state_root(record)
+    docker_root = _full_checkpoint_docker_root()
+    api = _load_full_checkpoint_api()
+    new_container_id = ""
+    resume_sec = 0.0
+    runtime_env = _normalize_runtime_env(
+        record.get("runtime_env", {}) if isinstance(record.get("runtime_env"), dict) else {}
+    )
+    runtime_state = {
+        "schema_version": _RUNTIME_STATE_SCHEMA_VERSION,
+        "checkpoint_id": checkpoint_id,
+        "workspace": {"cwd": cwd, "repo_path": cwd},
+        "env": runtime_env,
+        "python_runtime": _derive_python_runtime(runtime_env),
+    }
+
+    try:
+        with _foreground_docker_section():
+            # docker-full-checkpoint clones the source image, command, env,
+            # workdir, network mode, memory and pids limits before restore.
+            resume_started = time.perf_counter()
+            resumed = api.full_resume(
+                checkpoint_id,
+                options=api.resume_options(
+                    state_root=state_root,
+                    container_id=target_name,
+                    keep_failed=True,
+                    criu_timeout_sec=max(
+                        1, int(_SERVER_CONFIG.full_checkpoint_criu_timeout_sec)
+                    ),
+                    docker_managed=True,
+                    docker_root=docker_root,
+                ),
+            )
+            resume_sec = time.perf_counter() - resume_started
+            new_container_id = str(resumed.get("docker_container_id", "") or "")
+            if not new_container_id:
+                raise RuntimeError("full resume did not return docker_container_id")
+            if not bool(resumed.get("docker_exec_supported", False)):
+                raise RuntimeError("full resume target does not support docker exec")
+            if not _docker_container_is_running(new_container_id, timeout=10):
+                raise RuntimeError(
+                    f"full resume target is not running: {new_container_id}"
+                )
+            _validate_runtime_restore(new_container_id, runtime_state)
+            try:
+                _remove_installed_docker_checkpoint(
+                    docker_root=docker_root,
+                    container_id=new_container_id,
+                    checkpoint_id=checkpoint_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Restored container is usable but installed-copy cleanup failed: %s",
+                    checkpoint_id,
+                    exc_info=True,
+                )
+
+        old_info: dict[str, Any] | None = None
+        if old_container_id:
+            with _lock:
+                snapshot = _active_containers.get(old_container_id)
+                if isinstance(snapshot, dict):
+                    old_info = dict(snapshot)
+            with _container_exclusive_section(old_container_id):
+                with _foreground_docker_section():
+                    _docker_destroy_container(old_container_id, timeout=300)
+            _drop_container_op_gate(old_container_id)
+
+        with _lock:
+            if old_container_id:
+                _active_containers.pop(old_container_id, None)
+            _active_containers[new_container_id] = {
+                **(old_info or {}),
+                "name": target_name,
+                "image": image,
+                "cwd": cwd,
+                "runtime_env": runtime_env,
+                "runtime_state": runtime_state,
+                "created_at": time.time(),
+                "pooled": False,
+                "acquisition": "full_checkpoint_rerun",
+                "create_time_sec": resume_sec,
+                "reset_time_sec": 0.0,
+            }
+        _CHECKPOINTS.mark_used(checkpoint_id)
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_backend": "full",
+            "checkpoint_image": None,
+            "restored_image": image,
+            "new_container_id": new_container_id,
+            "target_name": target_name,
+            "full_resume_sec": resume_sec,
+            "create_time_sec": resume_sec,
+        }
+    except Exception:
+        try:
+            with _foreground_docker_section():
+                _docker_destroy_container(target_name, timeout=300)
+            if new_container_id:
+                _drop_container_op_gate(new_container_id)
+        except Exception:
+            logger.exception(
+                "Failed to destroy full-resume target after restore error: %s", target_name
+            )
+        raise
+
+
 @app.post("/container/rerun")
 def container_rerun():
     data = request.get_json(force=True) or {}
@@ -4020,9 +4728,42 @@ def container_rerun():
     if record.get("status") != "ready":
         return jsonify({"ok": False, "error": "checkpoint not ready", "error_code": "checkpoint_not_ready", "retryable": True}), 409
 
+    request_lease_id = str(data.get("lease_id", "") or "")
+    record_lease_id = str(record.get("lease_id", "") or "")
+    if request_lease_id and record_lease_id and request_lease_id != record_lease_id:
+        return jsonify({
+            "ok": False,
+            "error": "checkpoint belongs to another lease",
+            "error_code": "checkpoint_lease_mismatch",
+            "retryable": False,
+        }), 409
+
     image = str(record.get("checkpoint_image", ""))
     cwd = str(data.get("cwd", record.get("cwd", "/testbed")))
     timeout = int(data.get("timeout", 120))
+    if _record_checkpoint_backend(record) == "full":
+        try:
+            return jsonify(
+                _full_checkpoint_rerun(
+                    record=record,
+                    old_container_id=str(old_container_id) if old_container_id else None,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+            )
+        except Exception as exc:
+            logger.exception(
+                "Full checkpoint rerun failed checkpoint_id=%s old_container_id=%s",
+                checkpoint_id,
+                old_container_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": str(exc),
+                "error_code": "full_rerun_failed",
+                "retryable": True,
+                "checkpoint_backend": "full",
+            }), 500
     try:
         with _foreground_docker_section():
             created = _docker_create_container(image=image, cwd=cwd, timeout=timeout)

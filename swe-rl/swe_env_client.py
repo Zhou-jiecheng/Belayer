@@ -27,6 +27,10 @@ try:
 except Exception:  # pragma: no cover - standalone replay may not have slime installed
     slime_http_post = None
 
+# Backward-compatible patch point used by the standalone client tests and by
+# deployments that replace Slime's HTTP helper at import time.
+post = slime_http_post
+
 
 class SweEnvClient:
     def __init__(self, base_url: str | None = None):
@@ -38,7 +42,13 @@ class SweEnvClient:
         self.allocate_app_max_retries = int(os.getenv("SWE_ALLOCATE_APP_MAX_RETRIES", "360"))
         self.default_http_timeout_sec = float(os.getenv("SWE_ENV_HTTP_TIMEOUT_SEC", "30"))
         self.evaluate_http_timeout_sec = float(os.getenv("SWE_EVALUATE_HTTP_TIMEOUT_SEC", "0") or "0")
-        self.checkpoint_timeout_sec = float(os.getenv("SWE_CHECKPOINT_TIMEOUT_SEC", "10"))
+        self.checkpoint_timeout_sec = float(os.getenv("SWE_CHECKPOINT_TIMEOUT_SEC", "60"))
+        self.checkpoint_create_timeout_sec = float(
+            os.getenv("SWE_CHECKPOINT_CREATE_HTTP_TIMEOUT_SEC", "600")
+        )
+        self.checkpoint_resume_timeout_sec = float(
+            os.getenv("SWE_CHECKPOINT_RESUME_HTTP_TIMEOUT_SEC", "300")
+        )
         self.app_error_retry_delay_sec = float(os.getenv("SWE_ENV_APP_RETRY_DELAY_SEC", "1.0"))
         self.app_error_retry_jitter_sec = float(os.getenv("SWE_ENV_APP_RETRY_JITTER_SEC", "0.2"))
         self.app_error_retry_max_delay_sec = float(os.getenv("SWE_ENV_APP_RETRY_MAX_DELAY_SEC", "5.0"))
@@ -79,9 +89,9 @@ class SweEnvClient:
         timeout: float = 30.0,
         use_slime: bool = True,
     ) -> dict[str, Any]:
-        if use_slime and slime_http_post is not None:
+        if use_slime and post is not None:
             try:
-                out = await slime_http_post(
+                out = await post(
                     f"{self.base_url}/{path}",
                     payload,
                     max_retries=1,
@@ -171,6 +181,7 @@ class SweEnvClient:
         path: str,
         payload: dict[str, Any],
         op_name: str,
+        timeout_sec: float | None = None,
     ) -> dict[str, Any]:
         started_perf = time.perf_counter()
         lease_id = str(payload.get("lease_id", ""))
@@ -178,10 +189,13 @@ class SweEnvClient:
         command_seq = int(payload.get("command_seq", -1))
         policy = str(payload.get("policy", ""))
         checkpoint_id = payload.get("checkpoint_id")
+        request_timeout_sec = float(
+            self.checkpoint_timeout_sec if timeout_sec is None else timeout_sec
+        )
         try:
             out = await asyncio.wait_for(
-                self._post_once(path, payload, timeout=self.checkpoint_timeout_sec),
-                timeout=self.checkpoint_timeout_sec,
+                self._post_once(path, payload, timeout=request_timeout_sec),
+                timeout=request_timeout_sec,
             )
         except Exception as exc:
             timed_out = self._is_timeout_error(exc)
@@ -194,23 +208,21 @@ class SweEnvClient:
                     step_idx,
                     command_seq,
                     policy,
-                    self.checkpoint_timeout_sec,
+                    request_timeout_sec,
                     elapsed_sec,
                     timed_out,
                     exc,
                 )
             else:
                 logger.warning(
-                    "[SWE-CLIENT] {} failed without retry (timeout={}s): {}",
-                    op_name,
-                    self.checkpoint_timeout_sec,
-                    exc,
+                    f"[SWE-CLIENT] {op_name} failed without retry "
+                    f"(timeout={request_timeout_sec}s): {exc}"
                 )
             return {
                 "ok": False,
                 "error": str(exc),
                 "timed_out": timed_out,
-                "timeout_sec": self.checkpoint_timeout_sec,
+                "timeout_sec": request_timeout_sec,
                 "retryable": False,
                 "error_code": f"{op_name}_{'timeout' if timed_out else 'failed'}",
             }
@@ -237,16 +249,14 @@ class SweEnvClient:
 
         elapsed_sec = time.perf_counter() - started_perf
         logger.warning(
-            "[SWE-CLIENT] {} returned non-dict response without retry after {:.3f}s: {!r}",
-            op_name,
-            elapsed_sec,
-            out,
+            f"[SWE-CLIENT] {op_name} returned non-dict response without retry "
+            f"after {elapsed_sec:.3f}s: {out!r}"
         )
         return {
             "ok": False,
             "error": f"non_dict_response:{out!r}",
             "timed_out": False,
-            "timeout_sec": self.checkpoint_timeout_sec,
+            "timeout_sec": request_timeout_sec,
             "retryable": False,
             "error_code": f"{op_name}_invalid_response",
         }
@@ -367,11 +377,24 @@ class SweEnvClient:
         )
 
     async def checkpoint_probe(self, lease_id: str) -> dict[str, Any]:
-        return await self._post_checkpoint_once(
+        out = await self._post_checkpoint_once(
             path="checkpoint/probe",
             payload={"lease_id": lease_id},
             op_name="checkpoint_probe",
         )
+        if out.get("ok", False):
+            return out
+        if out.get("busy", False) or out.get("error_code") == "checkpoint_busy":
+            return {**out, "ok": True, "busy": True}
+        if out.get("timed_out", False):
+            return {
+                **out,
+                "ok": True,
+                "busy": True,
+                "reason": "checkpoint_probe_timeout",
+                "probe_wait_sec": float(out.get("timeout_sec", self.checkpoint_timeout_sec)),
+            }
+        return out
 
     async def checkpoint_create(
         self,
@@ -385,6 +408,7 @@ class SweEnvClient:
         reason: str = "manual",
         parent_checkpoint_id: str | None = None,
         fault_injection_spec: dict[str, Any] | None = None,
+        checkpoint_backend: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "lease_id": lease_id,
@@ -401,10 +425,13 @@ class SweEnvClient:
             payload["parent_checkpoint_id"] = parent_checkpoint_id
         if fault_injection_spec:
             payload["fault_injection_spec"] = dict(fault_injection_spec)
+        if checkpoint_backend:
+            payload["checkpoint_backend"] = checkpoint_backend
         return await self._post_checkpoint_once(
             path="checkpoint/create",
             payload=payload,
             op_name="checkpoint_create",
+            timeout_sec=self.checkpoint_create_timeout_sec,
         )
 
     async def checkpoint_status(self, lease_id: str, checkpoint_id: str) -> dict[str, Any]:
@@ -454,7 +481,7 @@ class SweEnvClient:
         *,
         checkpoint_id: str | None = None,
         cwd: str | None = None,
-        timeout: int = 120,
+        timeout: int = 300,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"lease_id": lease_id, "timeout": int(timeout)}
         if checkpoint_id is not None:
@@ -465,4 +492,5 @@ class SweEnvClient:
             path="rerun",
             payload=payload,
             op_name="rerun",
+            timeout_sec=max(self.checkpoint_resume_timeout_sec, float(timeout) + 30.0),
         )

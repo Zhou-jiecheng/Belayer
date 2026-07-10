@@ -300,7 +300,69 @@ class TestSweEnvPoolCheckpoint(unittest.TestCase):
             {"phase": "after_commit_before_ready"},
         )
 
-    def test_checkpoint_status_updates_latest_ready_checkpoint(self):
+    def test_synchronous_checkpoint_create_updates_latest_ready_pointer(self):
+        pool = make_pool()
+        lease = pool_server.Lease(
+            lease_id="lease-1",
+            node_url="http://node-1:5000",
+            container_id="cid-1",
+            image="img:base",
+            instance_id="inst-1",
+            generation=2,
+        )
+        pool._leases[lease.lease_id] = lease  # pylint: disable=protected-access
+
+        def fake_post(_url: str, _payload: dict, timeout: int = 300) -> dict:
+            del timeout
+            return {
+                "ok": True,
+                "status": "ready",
+                "checkpoint_id": "ckpt-full",
+                "checkpoint_backend": "full",
+                "container_id": "cid-1",
+                "generation": 2,
+                "step_idx": 9,
+            }
+
+        with patch.object(pool_server, "_post_exec", new=fake_post):
+            out = pool.checkpoint_create("lease-1", step_idx=9)
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(lease.latest_ready_checkpoint_id, "ckpt-full")
+        self.assertEqual(lease.latest_checkpoint_step_idx, 9)
+
+    def test_full_rerun_keeps_restored_base_image_when_checkpoint_image_is_none(self):
+        pool = make_pool()
+        lease = pool_server.Lease(
+            lease_id="lease-1",
+            node_url="http://node-1:5000",
+            container_id="cid-old",
+            image="img:base",
+            instance_id="inst-1",
+            latest_ready_checkpoint_id="ckpt-full",
+        )
+        pool._leases[lease.lease_id] = lease  # pylint: disable=protected-access
+
+        def fake_post(_url: str, _payload: dict, timeout: int = 300) -> dict:
+            del timeout
+            return {
+                "ok": True,
+                "checkpoint_id": "ckpt-full",
+                "checkpoint_backend": "full",
+                "checkpoint_image": None,
+                "restored_image": "img:base",
+                "new_container_id": "cid-new",
+            }
+
+        with patch.object(pool_server, "_post_exec", new=fake_post):
+            out = pool.rerun("lease-1")
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(lease.image, "img:base")
+        self.assertEqual(lease.current_image, "img:base")
+        self.assertNotEqual(lease.image, "None")
+
+    def test_checkpoint_status_is_deprecated(self):
         pool = make_pool()
         lease = pool_server.Lease(
             lease_id="lease-1",
@@ -312,17 +374,11 @@ class TestSweEnvPoolCheckpoint(unittest.TestCase):
         )
         pool._leases[lease.lease_id] = lease  # pylint: disable=protected-access
 
-        def fake_post(url: str, payload: dict, timeout: int = 300) -> dict:
-            self.assertEqual(url, "http://node-1:5000/container/checkpoint/status")
-            self.assertEqual(payload, {"checkpoint_id": "ckpt-7"})
-            return {"ok": True, "checkpoint_id": "ckpt-7", "status": "ready", "generation": 3, "step_idx": 11}
+        out = pool.checkpoint_status("lease-1", "ckpt-7")
 
-        with patch.object(pool_server, "_post_exec", new=fake_post):
-            out = pool.checkpoint_status("lease-1", "ckpt-7")
-
-        self.assertTrue(out["ok"])
-        self.assertEqual(lease.latest_ready_checkpoint_id, "ckpt-7")
-        self.assertEqual(lease.latest_checkpoint_step_idx, 11)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error_code"], "checkpoint_status_deprecated")
+        self.assertIsNone(lease.latest_ready_checkpoint_id)
 
     def test_rerun_updates_lease_state(self):
         pool = make_pool()
@@ -356,6 +412,7 @@ class TestSweEnvPoolCheckpoint(unittest.TestCase):
             seen[0][1],
             {
                 "checkpoint_id": "ckpt-9",
+                "lease_id": "lease-1",
                 "old_container_id": "cid-old",
                 "cwd": "/workspace",
                 "timeout": 99,
