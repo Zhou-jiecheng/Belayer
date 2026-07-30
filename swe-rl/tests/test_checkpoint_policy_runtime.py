@@ -13,6 +13,7 @@ sys.path.insert(0, str(SWE_RL_DIR))
 from checkpoint_policy_runtime import (  # noqa: E402
     LongTrajectoryFaultPlanner,
     adaptive_delta_replay_cost_sec,
+    adaptive_expected_benefit_sec,
     fault_injection_armed_for_policy,
     fault_injection_enabled_for_policy,
     redo_replay_cost_sec,
@@ -77,6 +78,23 @@ class CheckpointPolicyRuntimeTests(unittest.TestCase):
                 latest_ready_protected_llm_cost_sec=2.5,
             ),
             13.0,
+        )
+
+    def test_adaptive_expected_benefit_uses_full_regeneration_cost(self) -> None:
+        self.assertAlmostEqual(adaptive_expected_benefit_sec(0.05, 10.0), 0.5)
+
+    def test_should_probe_when_benefit_equals_visible_overhead(self) -> None:
+        self.assertTrue(
+            should_probe_in_llm_bubble(
+                current_step_idx=3,
+                probe_attempted_in_bubble=False,
+                adaptive_checkpoint_submitted=False,
+                pending_checkpoints=[],
+                delta_env_cost_sec_value=10.0,
+                steps_since_latest_ready_checkpoint=10,
+                expected_benefit_sec=1.0,
+                expected_overhead_sec=1.0,
+            )
         )
 
     def test_long_trajectory_fault_planner_selects_longest_registered_samples(self) -> None:

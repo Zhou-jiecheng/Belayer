@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "${SWE_RL_DIR}/.." && pwd)"
 SLIME_DIR="${REPO_ROOT}/slime"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-TRAJ_ROOT="${TRAJ_ROOT:-${1:-/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/export/swe_rl_online_scheduler_adaptive_fast_restart_no_ckpt/swe_rollouts}"
+TRAJ_ROOT="${TRAJ_ROOT:-${1:-${REPO_ROOT}/export/swe_rollouts}}"
 if [[ -z "${TRAJ_ROOT}" ]]; then
     echo "Usage: $0 <trajectory_root> [extra replay args...]" >&2
     echo "Example: $0 ${REPO_ROOT}/export/swe_rollouts_profile_20260325_093408 --limit 32" >&2
@@ -36,7 +36,7 @@ EXPERIMENT_INJECTION_SEED="${EXPERIMENT_INJECTION_SEED:-20260407}"
 SIMULATE_LLM_DELAY="${SIMULATE_LLM_DELAY:-1}"
 POLICIES="${POLICIES:-adaptive-risk oracle-no-fault-no-checkpoint never always every-3}" #oracle-no-fault-no-checkpoint never always
 EXPERIMENT_OUTPUT_ROOT="${EXPERIMENT_OUTPUT_ROOT:-${REPO_ROOT}/export/checkpoint_policy_fault_experiment_$(date +%Y%m%d_%H%M%S)}"
-ADAPTIVE_RISK_CHECKPOINT_OVERHEAD=13
+ADAPTIVE_RISK_CHECKPOINT_OVERHEAD=8
 ADAPTIVE_FAILURE_PROB=0.01
 
 mkdir -p "${EXPERIMENT_OUTPUT_ROOT}"

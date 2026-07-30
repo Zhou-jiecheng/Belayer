@@ -24,26 +24,30 @@ class TestReplaySweCheckpointFaultExperiment(unittest.TestCase):
 
     def test_adaptive_tail_model_conditional_tail(self):
         model = fault_tool.AdaptiveTailModel.from_waits([5.0, 8.0, 12.0], budget_sec=7.0)
-        self.assertAlmostEqual(model.conditional_tail_probability(0.0), 2.0 / 3.0)
-        self.assertAlmostEqual(model.conditional_tail_probability(5.0), 0.0)
+        self.assertAlmostEqual(model.conditional_survival_probability(0.0), 2.0 / 3.0)
+        self.assertAlmostEqual(model.conditional_survival_probability(5.0), 0.0)
 
-    def test_adaptive_tail_model_expected_overhead(self):
+    def test_adaptive_tail_model_integrates_expected_visible_overhead(self):
         model = fault_tool.AdaptiveTailModel.from_waits([5.0, 8.0, 12.0], budget_sec=7.0)
-        self.assertAlmostEqual(model.expected_exposed_overhead(0.0), 2.0 / 3.0)
-        self.assertAlmostEqual(model.expected_exposed_overhead(5.0), 2.0)
-        self.assertAlmostEqual(model.expected_exposed_overhead(12.0), 7.0)
+        self.assertAlmostEqual(model.expected_visible_overhead(0.0), 2.0 / 3.0)
+        self.assertAlmostEqual(model.expected_visible_overhead(5.0), 2.0)
+        self.assertAlmostEqual(model.expected_visible_overhead(12.0), 7.0)
+        self.assertAlmostEqual(
+            model.expected_visible_overhead(5.0, checkpoint_duration_sec=2.0),
+            0.0,
+        )
 
     def test_redo_cost_includes_llm_and_exec_cost(self):
         self.assertAlmostEqual(fault_tool._redo_replay_cost_sec(12.5, 4.0, 7.0, 2.5), 13.0)
         self.assertAlmostEqual(fault_tool._redo_replay_cost_sec(3.0, 4.0, 1.0, 2.0), 0.0)
 
-    def test_adaptive_expected_benefit_includes_conditional_tail_probability(self):
+    def test_adaptive_expected_benefit_is_failure_probability_times_regeneration_cost(self):
         self.assertAlmostEqual(
-            fault_tool._adaptive_expected_benefit_sec(0.05, 0.8, 10.0),
-            0.4,
+            fault_tool._adaptive_expected_benefit_sec(0.05, 10.0),
+            0.5,
         )
         self.assertAlmostEqual(
-            fault_tool._adaptive_expected_benefit_sec(0.05, 0.0, 10.0),
+            fault_tool._adaptive_expected_benefit_sec(0.0, 10.0),
             0.0,
         )
 

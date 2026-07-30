@@ -270,18 +270,6 @@ class SweEnvClient:
             app_max_retries=self.allocate_app_max_retries,
         )
 
-    def _get_blocking(self, path: str, timeout: float = 30.0) -> dict[str, Any]:
-        req = urllib_request.Request(f"{self.base_url}/{path}", method="GET")
-        with urllib_request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise RuntimeError(f"Unexpected response payload for GET {path}: {parsed!r}")
-        return parsed
-
-    async def status(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._get_blocking, "status", 30.0)
-
     async def heartbeat(self, lease_id: str) -> None:
         await self._post_with_retry(
             path="heartbeat",
@@ -356,24 +344,6 @@ class SweEnvClient:
             payload={"lease_id": lease_id},
             op_name="close",
             http_max_retries=self.default_max_retries,
-        )
-
-    async def stats(self, lease_id: str) -> dict[str, Any]:
-        return await self._post_with_retry(
-            path="stats",
-            payload={"lease_id": lease_id},
-            op_name="stats",
-            http_max_retries=1,
-            app_max_retries=1,
-        )
-
-    async def stats_batch(self, lease_ids: list[str]) -> dict[str, Any]:
-        return await self._post_with_retry(
-            path="stats_batch",
-            payload={"lease_ids": lease_ids},
-            op_name="stats_batch",
-            http_max_retries=1,
-            app_max_retries=1,
         )
 
     async def checkpoint_probe(self, lease_id: str) -> dict[str, Any]:

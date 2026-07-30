@@ -5,7 +5,7 @@
 目标读者：
 - `swe_exec_server.py` 维护者
 - `swe_env_pool_server.py` 维护者
-- rollout / scheduler / env client 维护者
+- rollout / env client 维护者
 
 本文档对应的现有架构可参考：
 - [SWE_REMOTE_DOCKER.md](/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/docs/cn/SWE_REMOTE_DOCKER.md)
@@ -160,7 +160,6 @@ pool server 分配给 rollout 的逻辑容器句柄，由 `lease_id` 标识。
 - [swe_env_pool_server.py](/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/server/swe_env_pool_server.py)
 - [swe_env_client.py](/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/swe_env_client.py)
 - [generate_with_swe_remote.py](/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/generate_with_swe_remote.py)
-- [online_env_docker_scheduler.py](/mnt/shared-storage-user/ailab-sys/zhoujiecheng/projs/robust_rl/OpenClaw-RL/swe-rl/online_env_docker_scheduler.py)
 
 ### 6.2 建议新增测试
 
@@ -920,7 +919,7 @@ rerun 后 rollout 需要：
 | `SWE_CHECKPOINT_TTL_SEC` | `86400` | checkpoint TTL |
 | `SWE_CHECKPOINT_MAX_BYTES` | `21474836480` | 节点 checkpoint 预算 |
 
-### 16.2 Rollout / scheduler
+### 16.2 Rollout
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
@@ -1021,8 +1020,6 @@ Phase 1 checkpoint 仅对生成它的 node 有效。
 
 - `generate_with_swe_remote.py`
   - step 完成后调用 probe/create
-- `online_env_docker_scheduler.py`
-  - 记录 lease 的 checkpoint / rerun 状态
 
 验收：
 
