@@ -59,7 +59,6 @@ from checkpoint_policy_runtime import (
     should_probe_in_llm_bubble,
 )
 from swe_env_client import SweEnvClient
-from online_env_docker_scheduler import OnlineEnvDockerScheduler, SchedulerConfig
 from swe_utils import get_docker_image_name
 from message_utils import get_response_ids_and_loss_mask_from_messages
 from swe_context_manager import get_context_messages
@@ -100,12 +99,8 @@ def _extract_assistant_turn_spans(loss_mask: list[int]) -> list[list[int]]:
 
 @lru_cache(maxsize=1)
 def _get_swe_semaphore() -> asyncio.Semaphore:
-    if _env_flag("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", False):
-        # Let online scheduler admission decide effective concurrency.
-        max_inflight = int(os.getenv("SWE_SCHED_INTERNAL_MAX_INFLIGHT", "4096"))
-        logger.info("[SWE-R] Online scheduler mode: semaphore set to {}", max_inflight)
-        return asyncio.Semaphore(max(1, max_inflight))
-    return asyncio.Semaphore(int(os.getenv("SWE_MAX_CONCURRENT", "8")))
+    max_inflight = int(os.getenv("SWE_MAX_CONCURRENT", "8"))
+    return asyncio.Semaphore(max(1, max_inflight))
 
 
 @lru_cache(maxsize=1)
@@ -143,23 +138,8 @@ class _DockerCreateLimiter:
 
 @lru_cache(maxsize=1)
 def _get_docker_create_limiter() -> _DockerCreateLimiter:
-    if _env_flag("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", False):
-        # Keep limiter enabled in scheduler mode to protect docker daemon.
-        max_concurrent = int(
-            os.getenv(
-                "SWE_SCHED_DOCKER_CREATE_MAX_CONCURRENT",
-                os.getenv("SWE_MAX_CONCURRENT_DOCKER_CREATE", "16"),
-            )
-        )
-        min_interval_sec = float(
-            os.getenv(
-                "SWE_SCHED_DOCKER_CREATE_MIN_INTERVAL_SEC",
-                os.getenv("SWE_DOCKER_CREATE_MIN_INTERVAL_SEC", "0.05"),
-            )
-        )
-    else:
-        max_concurrent = int(os.getenv("SWE_MAX_CONCURRENT_DOCKER_CREATE", "1"))
-        min_interval_sec = float(os.getenv("SWE_DOCKER_CREATE_MIN_INTERVAL_SEC", "0.5"))
+    max_concurrent = int(os.getenv("SWE_MAX_CONCURRENT_DOCKER_CREATE", "1"))
+    min_interval_sec = float(os.getenv("SWE_DOCKER_CREATE_MIN_INTERVAL_SEC", "0.5"))
 
     limiter = _DockerCreateLimiter(
         max_concurrent=max_concurrent,
@@ -186,27 +166,6 @@ def _get_sweagent_config() -> dict:
                 )
             return yaml.safe_load(p.read_text())
     raise FileNotFoundError(f"SWE config not found: {config_path}")
-
-
-@lru_cache(maxsize=1)
-def _get_online_env_docker_scheduler() -> OnlineEnvDockerScheduler | None:
-    config = SchedulerConfig.from_env()
-    if not config.enabled:
-        return None
-    scheduler = OnlineEnvDockerScheduler(env_client=SweEnvClient(), config=config)
-    logger.info(
-        "[SWE-SCHED] Online env docker scheduler enabled: "
-        f"sampling_interval={config.sampling_interval_sec}s, "
-        f"safety_margin={config.scheduler_safety_margin}, "
-        f"preserve_prompt_order={config.preserve_prompt_order}, "
-        f"realtime_local_active_discount={config.realtime_local_active_discount}, "
-        f"realtime_remaining(mem={config.use_realtime_server_memory}, "
-        f"cpu={config.use_realtime_server_cpu}, disk={config.use_realtime_server_disk}), "
-        f"oversell(mem={config.memory_oversell_ratio}, cpu={config.cpu_oversell_ratio}, "
-        f"disk_read={config.disk_read_oversell_ratio}, disk_write={config.disk_write_oversell_ratio}), "
-        f"use_resource_stats_dir={config.use_resource_stats_dir}"
-    )
-    return scheduler
 
 
 def _sanitize_filename(value: str) -> str:
@@ -772,11 +731,12 @@ async def _wait_for_llm_with_adaptive_checkpointing(
             steps_since_latest_ready_checkpoint = (
                 current_step_idx if latest_step < 0 else max(0, current_step_idx - latest_step)
             )
-            expected_overhead_sec = tail_model.expected_exposed_overhead(waited_in_llm_sec)
-            conditional_tail_prob = tail_model.conditional_tail_probability(waited_in_llm_sec)
+            expected_overhead_sec = tail_model.expected_visible_overhead(waited_in_llm_sec)
+            checkpoint_cover_probability = tail_model.conditional_survival_probability(
+                waited_in_llm_sec
+            )
             expected_benefit_sec = adaptive_expected_benefit_sec(
                 adaptive_failure_prob,
-                conditional_tail_prob,
                 redo_cost,
             )
             if llm_task.done():
@@ -818,7 +778,12 @@ async def _wait_for_llm_with_adaptive_checkpointing(
                         "waited_before_checkpoint_sec": waited_in_llm_sec,
                         "expected_benefit_sec": expected_benefit_sec,
                         "expected_overhead_sec": expected_overhead_sec,
-                        "conditional_tail_probability": conditional_tail_prob,
+                        "adaptive_failure_probability": adaptive_failure_prob,
+                        "checkpoint_duration_estimate_sec": tail_model.budget_sec,
+                        "checkpoint_cover_probability": checkpoint_cover_probability,
+                        # Retain the legacy diagnostic field. It no longer
+                        # discounts expected_benefit_sec.
+                        "conditional_tail_probability": checkpoint_cover_probability,
                         "redo_from_resume_step_idx": int(checkpoint_state["latest_ready_resume_step_idx"]),
                         "redo_until_step_idx": int(current_step_idx),
                         "redo_replay_cost_sec": redo_cost,
@@ -1511,22 +1476,9 @@ async def _generate_impl(
     })
 
     env_client = SweEnvClient()
-    scheduler = _get_online_env_docker_scheduler()
     swe_semaphore = _get_swe_semaphore()
     eval_semaphore = _get_eval_semaphore()
     docker_create_limiter = _get_docker_create_limiter()
-    admission_ticket = None
-
-    if scheduler is not None:
-        try:
-            admission_ticket = await scheduler.admit_prompt(
-                sample=sample,
-                image_name=image_name,
-                rollout_batch_size=int(getattr(args, "rollout_batch_size", 0) or 0),
-            )
-        except Exception as e:
-            logger.warning(f"[SWE-SCHED] Admission control failed, fallback to legacy order: {e}")
-            admission_ticket = None
 
     logger.info(
         "[SWE-R] [{}] rollout policy summary: checkpoint_policy={} fault_injection_enabled={} fault_injection_armed={} fault_injection_probability={} adaptive_budget_sec={} adaptive_failure_prob={} adaptive_decision_interval_sec={}",
@@ -1567,14 +1519,6 @@ async def _generate_impl(
         lease = await docker_create_limiter.allocate(env_client, image=image_name, instance_id=iid)
         lease_id = lease["lease_id"]
         logger.info(f"[SWE-R] [{iid}] Step 2/5: Container ready, lease={lease_id}")
-        if scheduler is not None and admission_ticket is not None:
-            try:
-                await scheduler.attach_lease(
-                    prompt_id=admission_ticket.prompt_id,
-                    lease_id=lease_id,
-                )
-            except Exception as e:
-                logger.warning(f"[SWE-SCHED] attach agent lease failed: {e}")
 
         max_context_len = int(getattr(args, "rollout_max_context_len", 0) or 0)
         max_new_tokens = int(model_config.get("model_kwargs", {}).get("max_tokens", 4096))
@@ -1611,8 +1555,6 @@ async def _generate_impl(
             try:
                 await env_client.close(lease_id)
                 logger.info(f"[SWE-R] [{iid}] Step 3/5: Closed agent container lease={lease_id}")
-                if scheduler is not None:
-                    await scheduler.detach_lease(lease_id, reason="agent_closed_before_eval")
                 lease_id = None
             except Exception:
                 logger.exception(f"[SWE-R] [{iid}] Failed to close agent lease before eval")
@@ -1631,14 +1573,6 @@ async def _generate_impl(
                 )
                 eval_lease_id = eval_lease["lease_id"]
                 logger.info(f"[SWE-R] [{iid}] Step 4/5: Eval container ready, lease={eval_lease_id}")
-                if scheduler is not None and admission_ticket is not None:
-                    try:
-                        await scheduler.attach_lease(
-                            prompt_id=admission_ticket.prompt_id,
-                            lease_id=eval_lease_id,
-                        )
-                    except Exception as e:
-                        logger.warning(f"[SWE-SCHED] attach eval lease failed: {e}")
                 try:
                     eval_result = await asyncio.wait_for(
                         env_client.evaluate(
@@ -1664,8 +1598,6 @@ async def _generate_impl(
                 if eval_lease_id is not None:
                     try:
                         await env_client.close(eval_lease_id)
-                        if scheduler is not None:
-                            await scheduler.detach_lease(eval_lease_id, reason="eval_closed")
                     except BaseException:
                         logger.warning(f"[SWE-R] [{iid}] Failed to close eval lease (may be cancelled)")
                     finally:
@@ -1693,8 +1625,6 @@ async def _generate_impl(
         if eval_lease_id is not None:
             try:
                 await env_client.close(eval_lease_id)
-                if scheduler is not None:
-                    await scheduler.detach_lease(eval_lease_id, reason="eval_closed")
             except BaseException:
                 logger.warning(f"[SWE-R] [{iid}] Failed to close eval lease (may be cancelled)")
         if eval_slot_acquired:
@@ -1704,17 +1634,10 @@ async def _generate_impl(
         if lease_id is not None:
             try:
                 await env_client.close(lease_id)
-                if scheduler is not None:
-                    await scheduler.detach_lease(lease_id, reason="agent_closed")
             except BaseException:
                 logger.warning(f"[SWE-R] [{iid}] Failed to close lease (may be cancelled)")
         swe_semaphore.release()
         logger.info(f"[SWE-R] [{iid}] Semaphore released")
-        if scheduler is not None and admission_ticket is not None:
-            try:
-                await scheduler.finish_prompt(admission_ticket.prompt_id)
-            except Exception as e:
-                logger.warning(f"[SWE-SCHED] finish prompt failed: {e}")
 
     if timed_out:
         sample.status = Sample.Status.ABORTED

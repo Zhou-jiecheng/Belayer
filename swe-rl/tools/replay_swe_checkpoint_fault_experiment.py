@@ -587,11 +587,12 @@ async def _run_one_trajectory(
                     and current_step_idx < len(steps)
                 ):
                     while waited_in_llm_sec < llm_delay:
-                        expected_overhead_sec = tail_model.expected_exposed_overhead(waited_in_llm_sec)
-                        conditional_tail_prob = tail_model.conditional_tail_probability(waited_in_llm_sec)
+                        expected_overhead_sec = tail_model.expected_visible_overhead(waited_in_llm_sec)
+                        checkpoint_cover_probability = tail_model.conditional_survival_probability(
+                            waited_in_llm_sec
+                        )
                         expected_benefit_sec = _adaptive_expected_benefit_sec(
                             args.adaptive_failure_prob,
-                            conditional_tail_prob,
                             redo_replay_cost_sec,
                         )
                         should_probe = _should_probe_in_llm_bubble(
@@ -616,7 +617,7 @@ async def _run_one_trajectory(
                             float(cumulative_llm_replay_cost_sec) - float(latest_ready_protected_llm_cost_sec),
                         )
                         logger.info(
-                            "adaptive decision traj=%s step_idx=%s waited_sec=%.3f llm_delay_sec=%.3f redo_replay_cost_sec=%.3f delta_replay_cost_sec=%.3f steps_since_latest_ready_checkpoint=%s expected_benefit_sec=%.3f expected_overhead_sec=%.3f conditional_tail_prob=%.6f pending_count=%s probe_attempted=%s submitted=%s should_probe=%s latest_ready_checkpoint_id=%s latest_ready_step=%s",
+                            "adaptive decision traj=%s step_idx=%s waited_sec=%.3f llm_delay_sec=%.3f redo_replay_cost_sec=%.3f delta_replay_cost_sec=%.3f steps_since_latest_ready_checkpoint=%s expected_benefit_sec=%.3f expected_overhead_sec=%.3f checkpoint_cover_probability=%.6f pending_count=%s probe_attempted=%s submitted=%s should_probe=%s latest_ready_checkpoint_id=%s latest_ready_step=%s",
                             traj_label,
                             current_step_idx,
                             waited_in_llm_sec,
@@ -626,7 +627,7 @@ async def _run_one_trajectory(
                             steps_since_latest_ready_checkpoint,
                             expected_benefit_sec,
                             expected_overhead_sec,
-                            conditional_tail_prob,
+                            checkpoint_cover_probability,
                             0,
                             probe_attempted_in_bubble,
                             adaptive_checkpoint_submitted,
@@ -643,6 +644,8 @@ async def _run_one_trajectory(
                                 "waited_before_checkpoint_sec": waited_in_llm_sec,
                                 "expected_benefit_sec": expected_benefit_sec,
                                 "expected_overhead_sec": expected_overhead_sec,
+                                "adaptive_failure_probability": args.adaptive_failure_prob,
+                                "checkpoint_duration_estimate_sec": tail_model.budget_sec,
                                 "redo_from_resume_step_idx": current_step_idx if latest_ready_checkpoint_step < 0 else latest_ready_checkpoint_step + 1,
                                 "redo_until_step_idx": current_step_idx,
                                 "redo_replay_cost_sec": redo_replay_cost_sec,
@@ -654,7 +657,10 @@ async def _run_one_trajectory(
                                 # Keep the legacy field for backward compatibility.
                                 "delta_env_cost_sec": delta_replay_cost_sec,
                                 "steps_since_latest_ready_checkpoint": steps_since_latest_ready_checkpoint,
-                                "conditional_tail_probability": conditional_tail_prob,
+                                "checkpoint_cover_probability": checkpoint_cover_probability,
+                                # Retain the legacy diagnostic field. It no
+                                # longer discounts expected_benefit_sec.
+                                "conditional_tail_probability": checkpoint_cover_probability,
                             }
                             checkpoint_event_count_before = len(report["checkpoint_events"])
                             create_result, busy = await _attempt_checkpoint_create(

@@ -46,32 +46,66 @@ class AdaptiveTailModel:
     def count(self) -> int:
         return len(self.sorted_waits)
 
-    def conditional_tail_probability(self, waited_sec: float, horizon_sec: float | None = None) -> float:
+    def conditional_survival_probability(
+        self,
+        waited_sec: float,
+        horizon_sec: float | None = None,
+    ) -> float:
+        """Estimate q(x; u) = P(T > x + u | T > x) from observed LLM waits."""
         if not self.sorted_waits:
             return 0.0
-        horizon = self.budget_sec if horizon_sec is None else float(horizon_sec)
-        lo = bisect.bisect_right(self.sorted_waits, waited_sec)
+        waited = max(0.0, float(waited_sec))
+        horizon = max(
+            0.0,
+            self.budget_sec if horizon_sec is None else float(horizon_sec),
+        )
+        lo = bisect.bisect_right(self.sorted_waits, waited)
         survivors = len(self.sorted_waits) - lo
         if survivors <= 0:
             return 0.0
-        hi = bisect.bisect_right(self.sorted_waits, waited_sec + horizon)
+        hi = bisect.bisect_right(self.sorted_waits, waited + horizon)
         tail_count = len(self.sorted_waits) - hi
         return tail_count / survivors
 
-    def expected_exposed_overhead(self, waited_sec: float) -> float:
+    def conditional_tail_probability(self, waited_sec: float, horizon_sec: float | None = None) -> float:
+        """Backward-compatible alias for conditional_survival_probability."""
+        return self.conditional_survival_probability(waited_sec, horizon_sec)
+
+    def expected_visible_overhead(
+        self,
+        waited_sec: float,
+        checkpoint_duration_sec: float | None = None,
+    ) -> float:
+        """Compute integral_0^c [1 - q(x; u)] du exactly for the empirical CDF.
+
+        For each observed response with T > x, the integral contributes
+        max(c - (T - x), 0). Prefix sums make the empirical conditional
+        expectation equivalent to the integral without numerical quadrature.
+        """
+        waited = max(0.0, float(waited_sec))
+        duration = max(
+            0.0,
+            self.budget_sec if checkpoint_duration_sec is None else float(checkpoint_duration_sec),
+        )
+        if duration == 0.0:
+            return 0.0
         if not self.sorted_waits:
-            return self.budget_sec
-        lo = bisect.bisect_right(self.sorted_waits, waited_sec)
+            return duration
+        lo = bisect.bisect_right(self.sorted_waits, waited)
         survivors = len(self.sorted_waits) - lo
         if survivors <= 0:
-            return self.budget_sec
-        hi = bisect.bisect_right(self.sorted_waits, waited_sec + self.budget_sec)
+            return duration
+        hi = bisect.bisect_right(self.sorted_waits, waited + duration)
         partial_count = hi - lo
         if partial_count <= 0:
             return 0.0
         partial_sum = self.prefix_sums[hi] - self.prefix_sums[lo]
-        exposed_total = partial_count * (waited_sec + self.budget_sec) - partial_sum
+        exposed_total = partial_count * (waited + duration) - partial_sum
         return max(0.0, exposed_total / survivors)
+
+    def expected_exposed_overhead(self, waited_sec: float) -> float:
+        """Backward-compatible alias for expected_visible_overhead."""
+        return self.expected_visible_overhead(waited_sec)
 
 
 @dataclass
@@ -121,10 +155,9 @@ def adaptive_delta_replay_cost_sec(
 
 def adaptive_expected_benefit_sec(
     failure_prob: float,
-    conditional_tail_prob: float,
-    redo_replay_cost_sec_value: float,
+    regeneration_cost_sec: float,
 ) -> float:
-    return max(0.0, float(failure_prob) * float(conditional_tail_prob) * float(redo_replay_cost_sec_value))
+    return max(0.0, float(failure_prob)) * max(0.0, float(regeneration_cost_sec))
 
 
 def should_probe_in_llm_bubble(
@@ -148,7 +181,7 @@ def should_probe_in_llm_bubble(
         return False
     if steps_since_latest_ready_checkpoint < int(min_steps_between_checkpoints):
         return False
-    return expected_benefit_sec > expected_overhead_sec
+    return expected_benefit_sec >= expected_overhead_sec
 
 
 class LongTrajectoryFaultPlanner:

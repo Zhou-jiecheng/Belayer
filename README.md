@@ -6,13 +6,12 @@
 
 **运行环境**：slime 官方镜像 `slime/slime:v0.2.2`。
 
-Belayer 构建在 [slime](slime/)、[SGLang](sglang/)、[Megatron-LM](Megatron-LM/) 和远程 Docker SWE 环境之上，目标是在长时间、多轮、异构的 LLM RL rollout 中，缩小故障影响范围并减少重复计算。系统不把所有问题都交给“整作业重启”，而是在最接近故障的位置分别处理环境状态、资源压力和推理服务中断。
+Belayer 构建在 [slime](slime/)、[SGLang](sglang/)、[Megatron-LM](Megatron-LM/) 和远程 Docker SWE 环境之上，目标是在长时间、多轮、异构的 LLM RL rollout 中，缩小故障影响范围并减少重复计算。系统不把所有问题都交给“整作业重启”，而是在最接近故障的位置分别处理环境状态和推理服务中断。
 
-当前项目聚焦三个设计：
+当前项目聚焦两个设计：
 
 1. **Env checkpoint**：默认通过 Docker-managed CRIU checkpoint 与 overlay upperdir 快照同时保存容器进程/内存和文件系统，并保留原 `docker commit + runtime.json` legacy backend；当前已接入的显式故障注入路径可从最近安全点继续，自然 OOM、transport error 和普通 exec exception 尚未统一触发自动 rerun。
-2. **Env workload-aware scheduling**：根据历史 workload 画像和集群实时剩余资源做四维准入与动态重排，尽量在 OOM、CPU/IO 争用和 Docker create storm 发生前削峰。
-3. **Rollout engine instant restart**：为 SGLang rollout engine 预启动 shadow worker；primary 故障后快速接管，并处理 endpoint 切换和后续权重更新重连；启用 custom SlimeRouter 时还可续跑在途 streaming generation。
+2. **Rollout engine instant restart**：为 SGLang rollout engine 预启动 shadow worker；primary 故障后快速接管，并处理 endpoint 切换和后续权重更新重连；启用 custom SlimeRouter 时还可续跑在途 streaming generation。
 
 本文只描述 `Belayer/` 内的当前实现。已有设计稿用于解释背景，但当设计稿与代码不一致时，以当前代码行为为准。
 
@@ -24,12 +23,11 @@ Agentic RL 的一次 rollout 同时跨越三种状态：
 - **环境执行状态**：Docker 文件系统、代码修改、依赖安装、当前工作目录和 Python 环境；
 - **rollout 控制状态**：对话消息、step 游标、reward/PRM 任务以及尚未写入训练 buffer 的样本。
 
-三类状态的生命周期和恢复成本不同。只保存训练模型 checkpoint，不能恢复 `/testbed` 中已经完成的修改；只恢复 Docker 容器，也不能让已经断开的 generation 自动续跑；只重启 rollout engine，则无法解决大量异构环境同时启动造成的主机 OOM。因此 Belayer 将容错拆成三个互补闭环：
+三类状态的生命周期和恢复成本不同。只保存训练模型 checkpoint，不能恢复 `/testbed` 中已经完成的修改；只恢复 Docker 容器，也不能让已经断开的 generation 自动续跑。因此 Belayer 将容错拆成两个互补闭环：
 
 | 层次 | 主要故障或压力 | 核心机制 | 保护粒度 |
 |---|---|---|---|
 | Environment state | 容器被杀、环境进度丢失 | Docker env checkpoint；显式故障注入时 rerun | 单 lease、单 trajectory step |
-| Environment capacity | 内存/CPU/磁盘过载、启动风暴 | workload profile + budgeted admission | 单 prompt、集群资源窗口 |
 | Rollout serving | SGLang primary 进程退出或失联 | shadow handover + router recovery | 单 engine group、单 generation |
 
 这里有三个容易混淆的 “checkpoint” 概念：
@@ -54,7 +52,6 @@ flowchart TB
     Primary[SGLang primary workers]
     Shadow[SGLang skeleton shadow workers]
 
-    Scheduler[workload-aware admission]
     Client[SweEnvClient]
     Pool[SWE env pool server]
     Exec[SWE exec server nodes]
@@ -70,13 +67,12 @@ flowchart TB
     Primary -. process failure .-> Shadow
     Shadow -->|register new URL and take over| Router
 
-    Rollout --> Scheduler
-    Scheduler --> Client --> Pool --> Exec --> Env
+    Rollout --> Client --> Pool --> Exec --> Env
     Env -->|safe action boundary| EnvCkpt
     EnvCkpt -->|rerun on original node| Env
 ```
 
-核心数据路径是：训练 actor 通过权重更新通信更新 active rollout engine；在 fast-restart 配置中，checkpoint-engine 为 primary/shadow 提供持久共享的权重 backing 与恢复装载能力；rollout 通过 router 调用 SGLang，并通过 `SweEnvClient` 操作远程 Docker 环境；环境执行完成后产生 observation，再进入下一轮 LLM generation。三个容错设计分别嵌入这条路径的不同位置，不要求每次局部故障都停止整个训练作业。
+核心数据路径是：训练 actor 通过权重更新通信更新 active rollout engine；在 fast-restart 配置中，checkpoint-engine 为 primary/shadow 提供持久共享的权重 backing 与恢复装载能力；rollout 通过 router 调用 SGLang，并通过 `SweEnvClient` 操作远程 Docker 环境；环境执行完成后产生 observation，再进入下一轮 LLM generation。两个容错设计分别嵌入这条路径的不同位置，不要求每次局部故障都停止整个训练作业。
 
 ## 3. 设计一：Env checkpoint
 
@@ -168,86 +164,9 @@ Checkpoint records 维护 parent lineage，并提供 list/delete/GC。full GC �
 - [`swe-rl/server/swe_env_pool_server.py`](swe-rl/server/swe_env_pool_server.py)
 - [`swe-rl/server/swe_exec_server.py`](swe-rl/server/swe_exec_server.py)
 
-## 4. 设计二：Env workload-aware scheduling
+## 4. 设计二：Rollout engine instant restart 与 router recovery
 
-### 4.1 设计定位
-
-Workload-aware scheduler 是单个 rollout Python 进程内的 **prompt 级资源准入器**，使用集群汇总预算决定哪个 prompt 可以开始占用 Docker 环境资源；具体把容器放到哪个节点，仍由 pool server 完成。
-
-这一机制主要是故障预防而非故障后恢复：通过限制资源总需求和 Docker 创建速率，降低 host OOM、CPU/IO 拥塞、dockerd 抖动以及大量未知 workload 同时冷启动的概率。
-
-### 4.2 Workload 画像
-
-调度使用四维资源向量：
-
-```text
-R = (peak memory, average CPU, disk read, disk write)
-```
-
-尽管部分变量仍沿用 `repo_resource_stats` 名称，当前画像实际以 **per-data / instance_id** 为 key；repo 主要用于展示和缺失 instance_id 时的 fallback。因此，同一 repo 的新 instance 默认仍可能走 cold start，而不是自动继承 repo 画像。
-
-画像有两个来源：
-
-- **离线 replay profile**：重放历史 trajectory，读取每个 instance 的 memory peak、CPU average、累计 disk IO 和 duration；
-- **在线 lease stats**：通过 pool 的 batch stats 路由到 exec node，采集 cgroup memory/CPU/IO；在线更新与持久化是可选开关，并非所有 launcher 默认开启。
-
-没有足够历史时，scheduler 使用 default prediction 乘以 cold-start memory/CPU multiplier，并通过 unknown workload concurrency cap 控制突发。
-
-### 4.3 实时预算与 admission
-
-每个 exec node 的 `/host_stats` 上报可用内存、CPU capacity 和磁盘带宽估计；pool `/status` 将健康节点汇总为 cluster available。每个资源维度的有效预算为：
-
-```text
-budget[d] = cluster_available[d]
-          × safety_margin
-          × oversell_ratio[d]
-```
-
-为对冲实时采样滞后，scheduler 还会从预算中扣除本进程已经 admission 的预测资源预留。一个新 prompt 只有在 memory、CPU、disk read 和 disk write 四个维度都满足预算，同时不违反 active、startup、unknown 和单刷新窗口 admission cap 时，才能启动。
-
-如果单个 workload 大于整个预算，且当前没有 active prompt，scheduler 会强制放行最老的 oversized prompt，避免队列永久死锁。
-
-### 4.4 动态重排
-
-在不强制保持输入顺序时，scheduler 从所有能够 fit 的 pending prompt 中选择最高 packing score：
-
-```text
-score = four-dimensional residual fill
-      + 0.6 × dominant-resource ratio
-      + 0.4 × age bonus
-```
-
-当前代码中的 duration bonus 和 unknown penalty 尚未真正加入 score。若开启 preserve-order，则优先检查队首；队首连续多次被预算阻塞后可以向后移动，缓解 head-of-line blocking。
-
-Rollout 侧会维持足够大的 pending window，并以分组 BFS 顺序提交候选，使 scheduler 有机会把不同资源形状的 workload 组合成多个执行 wave。Docker create 还有独立的并发和最小间隔限流，防止 admission 后形成新的启动风暴。
-
-### 4.5 反馈闭环与恢复协同
-
-Prompt 获得 admission ticket 后，agent lease 和后续 eval lease 都绑定到该 ticket。Prompt 完成或异常退出时，`finally` 路径关闭 lease、释放 semaphore 和资源预留，并可将采样 summary 更新到画像。任务若在等待 admission 时被取消，当前尚没有对应的 pending request cancellation cleanup。
-
-Env checkpoint rerun 会保持 `lease_id`，只替换 pool 中的 `container_id`。Scheduler 仍按同一 lease 读取 stats，因此单次容器恢复不需要重新 admission，也不会破坏 prompt 级资源 accounting。
-
-### 4.6 当前边界
-
-- 四维 admission 看的是 **cluster aggregate**；pool 的 node placement 只选择健康且 `active_containers` 最少的节点，并不是 per-node resource bin packing。
-- Scheduler 是 Python 进程内单例。多个 rollout 进程没有强一致的全局 reservation，只通过有采样延迟的 pool `/status` 间接协调。
-- 磁盘 workload 画像是累计 bytes，而 host budget 是 bytes/s，当前比较仍是启发式而非严格资源隔离。
-- 当前 key 是 instance，不提供 repo 级泛化；生产组合若禁用 live profile update，则离线画像之外的 instance 会持续使用 cold-start prediction。
-- Admission 异常会 fail-open 到 legacy order；scheduler 模式下内部 semaphore 通常较大，因此监控这一降级路径很重要。
-- 等待 admission 的 task 被取消时可能遗留 pending request；这一清理路径仍需补齐。
-- `plan_prompt_order()` 是离线辅助函数；生产中的真正重排来自在线 admission 候选选择。
-
-主要实现：
-
-- [`swe-rl/online_env_docker_scheduler.py`](swe-rl/online_env_docker_scheduler.py)
-- [`swe-rl/generate_with_swe_remote.py`](swe-rl/generate_with_swe_remote.py)
-- [`swe-rl/server/swe_env_pool_server.py`](swe-rl/server/swe_env_pool_server.py)
-- [`swe-rl/server/swe_exec_server.py`](swe-rl/server/swe_exec_server.py)
-- [`slime/slime/rollout/sglang_rollout.py`](slime/slime/rollout/sglang_rollout.py)
-
-## 5. 设计三：Rollout engine instant restart 与 router recovery
-
-### 5.1 Instant restart 的含义
+### 4.1 Instant restart 的含义
 
 Instant restart 的 fast path 不是故障后从磁盘重新启动一个完整 SGLang engine，而是为每个本地 regular rollout engine 预先启动一个 `skeleton_worker` shadow：
 
@@ -260,7 +179,7 @@ Instant restart 的 fast path 不是故障后从磁盘重新启动一个完整 S
 
 因此 “instant” 表示省去模型 cold load 和大部分初始化开销，而不是严格的零延迟或进程内存无缝迁移。
 
-### 5.2 两级故障检测与 handover
+### 4.2 两级故障检测与 handover
 
 Fast path 有两级检测：
 
@@ -280,7 +199,7 @@ Promotion 使用 lock 和 pending event 保证 watcher 与 health monitor 重复
 
 Health monitor 发起的多节点 group handover 要求组内每个节点 promotion 都成功，否则进入完整 engine restart；actor-local watcher 的 crash fast path 当前按节点独立接管，没有 group barrier。
 
-### 5.3 Router 的 worker incarnation 管理
+### 4.3 Router 的 worker incarnation 管理
 
 Custom `SlimeRouter` 为每个 engine node 使用稳定逻辑 key：
 
@@ -294,7 +213,7 @@ Router 同时维护 URL、stable key、单调 registration sequence 和 recovery
 
 这些 stable-key 和 token-level 语义只属于 `--use-slime-router` 路径。该开关裸代码默认关闭，当前 SWE 集成 launcher 也没有默认启用；fault-tolerance smoke scripts 才会显式打开。因此 shadow handover 可以配合标准 `sglang-router` 完成 endpoint 切换，但下述 token continuation 是 opt-in 能力。标准 router 提供自己的健康检查和整请求 retry，不提供 SlimeRouter 进程内 token checkpoint。
 
-### 5.4 在途 generation 恢复
+### 4.4 在途 generation 恢复
 
 对 streaming `/generate`，SlimeRouter 会消费上游 SSE，并累计：
 
@@ -315,13 +234,13 @@ remaining_max_new_tokens = original_max_new_tokens - len(retained_output_ids)
 
 Token checkpoint 只在 router 内存中；router 进程本身退出会丢失它。
 
-### 5.5 下一次 weight update 重连
+### 4.5 下一次 weight update 重连
 
 Shadow promotion 后，旧 primary 的 NCCL/IPC weight-update control group 已失效。每个 engine actor 会记录一次性 reconnect event；RolloutManager 在下一次 `get_rollout_engines_and_lock()` 时收集并按 engine group 去重，把它计入 `num_new_engines`。
 
 Megatron/FSDP actor 在真正推送下一版权重前重建 weight-update connections，并在成功后以 decrement 和 ack 语义消费事件，避免重连期间新到达的 handover 被整表清空。重连发生在**下一次 weight update**，不是 handover 的同步关键路径。
 
-### 5.6 降级路径与当前边界
+### 4.6 降级路径与当前边界
 
 - Shadow 不可用时，health monitor 会 suppress 对应 group、kill 旧 Ray actors、在原 placement group 重建 engine，然后解除 suppress。
 - Fast restart 关闭时，部分单节点故障可从健康 engine 使用 remote-instance loader 获取权重；seed 不健康则回退 storage load。
@@ -341,26 +260,23 @@ Megatron/FSDP actor 在真正推送下一版权重前重建 weight-update connec
 - [`checkpoint-engine/`](checkpoint-engine/)
 - [`sglang/`](sglang/)
 
-## 6. 三个设计如何协同
+## 5. 两个设计如何协同
 
 一次正常的 agent step 可以概括为：
 
-1. Workload-aware scheduler 根据 instance 画像与集群预算决定该 prompt 是否可以开始。
-2. Rollout 通过 router 请求 LLM，得到 action 后在远程 Docker 环境执行。
-3. Action 完成后，checkpoint policy 可以在下一步 LLM wait 中保存这一安全环境状态。
-4. 如果 SGLang primary 在 generation 中退出，shadow 接管 endpoint；启用 custom SlimeRouter 时还可从保留 token prefix 续跑，Docker 环境无需重建。
-5. 如果当前已接入的显式 Docker 环境故障在 action 前或 action 中被触发，rollout 从最近 env checkpoint 回退；router/engine 无需随之重启。
-6. Prompt 结束后释放 scheduler reservation，并把资源观测反馈给画像。
+1. Rollout 通过 router 请求 LLM，得到 action 后在远程 Docker 环境执行。
+2. Action 完成后，checkpoint policy 可以在下一步 LLM wait 中保存这一安全环境状态。
+3. 如果 SGLang primary 在 generation 中退出，shadow 接管 endpoint；启用 custom SlimeRouter 时还可从保留 token prefix 续跑，Docker 环境无需重建。
+4. 如果当前已接入的显式 Docker 环境故障在 action 前或 action 中被触发，rollout 从最近 env checkpoint 回退；router/engine 无需随之重启。
 
-这形成了三种不同的“损失上界”：
+这形成了两种不同的“损失上界”：
 
-- scheduler 尽量避免因资源过载损失整批并发任务；
 - env checkpoint 把环境重做量限制到最近安全 action 之后；
 - 启用 custom SlimeRouter 时，router token checkpoint 把在途 generation 的重做量限制到最近 token prefix 之后；标准 router 路径仍使用其整请求 retry。
 
-三种保护机制的状态粒度不同，也分别依赖不同的存活控制面。环境恢复依赖 rollout Python 状态仍在；可选的 token 续跑依赖 custom SlimeRouter 仍在；训练作业级恢复仍依赖 Megatron/FSDP training checkpoint。
+两种保护机制的状态粒度不同，也分别依赖不同的存活控制面。环境恢复依赖 rollout Python 状态仍在；可选的 token 续跑依赖 custom SlimeRouter 仍在；训练作业级恢复仍依赖 Megatron/FSDP training checkpoint。
 
-## 7. 配置入口
+## 6. 配置入口
 
 | 机制 | 关键入口 |
 |---|---|
@@ -368,20 +284,19 @@ Megatron/FSDP actor 在真正推送下一版权重前重建 weight-update connec
 | Full checkpoint | `SWE_FULL_CHECKPOINT_PROJECT_ROOT`、`SWE_FULL_CHECKPOINT_STATE_ROOT`、`SWE_FULL_CHECKPOINT_DOCKER_ROOT`、`SWE_FULL_CHECKPOINT_RUNTIME_STAGING_ROOT`、`SWE_FULL_CHECKPOINT_CRIU_TIMEOUT_SEC` |
 | Checkpoint HTTP deadline | Client: `SWE_CHECKPOINT_CREATE_HTTP_TIMEOUT_SEC`、`SWE_CHECKPOINT_RESUME_HTTP_TIMEOUT_SEC`；pool→exec: `SWE_CHECKPOINT_CREATE_FORWARD_TIMEOUT_SEC` |
 | Adaptive policy | `SWE_ADAPTIVE_TAIL_ROOT`、`SWE_ADAPTIVE_FAILURE_PROB`、`SWE_ADAPTIVE_CHECKPOINT_BUDGET_SEC`、最小 step/cost 间隔 |
-| Workload scheduler | `SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER` 及 `SWE_SCHED_*` 画像、预算、oversell、cold-start、sampling 配置 |
 | Engine fault tolerance | `--use-fault-tolerance`、health-check interval/timeout/first-wait |
 | Shadow fast restart | `--sglang-enable-fast-restart`、KV socket、weight server base port、GPU mapping、ready/stabilization timeout |
 | SlimeRouter recovery | `--use-slime-router` 及 `SLIME_ROUTER_GENERATE_*`、reroute、token recovery 配置 |
 
 具体 launcher 的文件名不能替代实际配置检查：当前部分名为 `adaptive_checkpoint` 或 `static_checkpoint` 的 wrapper 仍可能把 policy 默认设为 `never`。运行实验前应以最终导出的环境变量和 CLI 参数为准。
 
-## 8. 仓库结构与阅读顺序
+## 7. 仓库结构与阅读顺序
 
 ```text
 Belayer/
 ├── docker-full-checkpoint/ # Git submodule；Docker-managed CRIU + upperdir checkpoint/resume
 ├── slime/              # RL orchestration、RolloutManager、health monitor、router、fast restart
-├── swe-rl/             # SWE agent rollout、远程 Docker、env checkpoint、workload scheduler
+├── swe-rl/             # SWE agent rollout、远程 Docker、env checkpoint
 ├── checkpoint-engine/  # 推理权重快速装载与更新服务
 ├── sglang/             # SGLang runtime、skeleton worker、KV/weight 共享支持
 ├── Megatron-LM/        # 分布式训练后端
@@ -394,16 +309,16 @@ Belayer/
 
 建议按以下顺序阅读：
 
-1. 本文：三层容错的整体关系；
+1. 本文：两层容错的整体关系；
 2. [`swe-rl/docs/cn/SWE_ENV_CHECKPOINT_DESIGN.md`](swe-rl/docs/cn/SWE_ENV_CHECKPOINT_DESIGN.md)：env checkpoint 的设计背景；
 3. [`swe-rl/docs/swe_runtime_memory_recovery_plan.md`](swe-rl/docs/swe_runtime_memory_recovery_plan.md)：filesystem 与 runtime state 的边界；
 4. [`swe-rl/docs/cn/SWE_CHECKPOINT_DEBUG_WORKFLOW.md`](swe-rl/docs/cn/SWE_CHECKPOINT_DEBUG_WORKFLOW.md)：checkpoint replay 与 fault experiment；
 5. [`slime/docs/fast_restart.md`](slime/docs/fast_restart.md)：shadow fast restart 摘要；
 6. 上述每节列出的当前实现文件和 tests。
 
-需要注意：env checkpoint 设计稿仍保留早期“异步 create + status/probe”方案，而当前实现已经改为同步 create；`swe-rl/README.md` 中的 scheduler 粒度、默认预算和配置项也有部分漂移。阅读旧文档时应结合当前代码确认。
+需要注意：env checkpoint 设计稿仍保留早期“异步 create + status/probe”方案，而当前实现已经改为同步 create。阅读旧文档时应结合当前代码确认。
 
-## 9. 验证与实验资产
+## 8. 验证与实验资产
 
 Env checkpoint：
 
@@ -415,13 +330,6 @@ Env checkpoint：
 - [`swe-rl/tools/validate_swe_checkpoint_correctness.py`](swe-rl/tools/validate_swe_checkpoint_correctness.py)
 - [`swe-rl/tools/replay_swe_checkpoint_fault_experiment.py`](swe-rl/tools/replay_swe_checkpoint_fault_experiment.py)
 
-Workload scheduler：
-
-- [`swe-rl/tests/test_online_env_docker_scheduler.py`](swe-rl/tests/test_online_env_docker_scheduler.py)
-- [`swe-rl/tools/replay_swe_online_scheduler_experiment.py`](swe-rl/tools/replay_swe_online_scheduler_experiment.py)
-- [`swe-rl/tools/analyze_prompt_memory_prediction_accuracy.py`](swe-rl/tools/analyze_prompt_memory_prediction_accuracy.py)
-- [`swe-rl/scripts/monitor_container_resource_accuracy.py`](swe-rl/scripts/monitor_container_resource_accuracy.py)
-
 Instant restart 与 router：
 
 - [`slime/tests/test_fast_restart.py`](slime/tests/test_fast_restart.py)
@@ -429,9 +337,9 @@ Instant restart 与 router：
 - [`slime/scripts/fault_tolerance/`](slime/scripts/fault_tolerance/)
 - [`sglang/test/manual/test_shadow_worker_handover.py`](sglang/test/manual/test_shadow_worker_handover.py)
 
-当前仓库存在一定的测试漂移：scheduler fixtures 仍传入已删除的静态 budget 字段，fast-restart tests 也有若干 mock 与当前 health API 不一致。因此这些文件代表了已有覆盖意图和实验入口，但不能把整个测试目录当前全绿作为既成事实。
+当前仓库存在一定的测试漂移：fast-restart tests 有若干 mock 与当前 health API 不一致。因此这些文件代表了已有覆盖意图和实验入口，但不能把整个测试目录当前全绿作为既成事实。
 
-## 10. 当前容错边界
+## 9. 当前容错边界
 
 Belayer 当前主要保护 rollout 与 environment data plane，尚不等于完整的作业级高可用系统：
 
@@ -439,7 +347,6 @@ Belayer 当前主要保护 rollout 与 environment data plane，尚不等于完�
 - Ray head、router、pool server、checkpoint-engine、KV sidecar 和整节点故障需要额外的服务级冗余；
 - Env checkpoint 不能恢复跨节点状态、外部 volume 或不可回滚的远程副作用；
 - Shadow handover 不保证 sampling bitwise deterministic，也不能覆盖同时失去 primary 与 shadow 的故障；
-- Scheduler 本身只做启发式 admission，不提供强资源隔离；单容器 cgroup 限额由 exec server 独立配置；
 - 真实自然故障的分类、自动恢复触发、跨节点 checkpoint、自动 GC/磁盘治理和全链路一致性验证仍是后续工程化重点。
 
-因此，Belayer 更准确的定位是：**围绕 LLM RL rollout 关键路径构建的分层容错原型与实验平台**。它已经提供显式故障注入路径下的环境级回滚、资源感知准入、推理引擎快速接管，以及 custom SlimeRouter 路径下可选的请求级续跑，同时保留了将这些局部闭环扩展为作业级高可用系统的接口与验证工具。
+因此，Belayer 更准确的定位是：**围绕 LLM RL rollout 关键路径构建的分层容错原型与实验平台**。它已经提供显式故障注入路径下的环境级回滚、推理引擎快速接管，以及 custom SlimeRouter 路径下可选的请求级续跑，同时保留了将这些局部闭环扩展为作业级高可用系统的接口与验证工具。

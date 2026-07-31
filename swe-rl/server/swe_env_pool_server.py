@@ -704,212 +704,45 @@ class SweEnvPool:
                 lease.current_image = checkpoint_image
         return result
 
-    def stats(self, lease_id: str) -> dict[str, Any]:
-        lease = self._get_lease(lease_id)
-        result = _post_exec(
-            f"{lease.node_url}/container/stats",
-            {"container_id": lease.container_id},
-            timeout=30,
-        )
-        if not result.get("ok", False):
-            raise RuntimeError(f"Stats failed for lease={lease_id}: {result}")
-        return {
-            "ok": True,
-            "lease_id": lease_id,
-            "container_id": lease.container_id,
-            "node_url": lease.node_url,
-            "image": lease.image,
-            "base_image": lease.base_image,
-            "current_image": lease.current_image or lease.image,
-            "instance_id": lease.instance_id,
-            **result,
-        }
-
-    def stats_batch(self, lease_ids: list[str]) -> dict[str, Any]:
-        requested = [str(item).strip() for item in lease_ids if str(item).strip()]
-        if not requested:
-            return {"ok": True, "stats": {}}
-
-        stats: dict[str, dict[str, Any]] = {}
-        grouped: dict[str, list[tuple[str, Lease]]] = {}
-        with self._lock:
-            for lease_id in requested:
-                lease = self._leases.get(lease_id)
-                if lease is None:
-                    stats[lease_id] = {
-                        "ok": False,
-                        "error": f"Unknown lease_id: {lease_id}",
-                        "error_code": "unknown_lease_id",
-                        "lease_id": lease_id,
-                    }
-                    continue
-                grouped.setdefault(lease.node_url, []).append((lease_id, lease))
-
-        def _decorate(lease_id: str, lease: Lease, item: dict[str, Any]) -> dict[str, Any]:
-            payload = dict(item)
-            payload.setdefault("ok", False)
-            payload.update(
-                {
-                    "lease_id": lease_id,
-                    "container_id": lease.container_id,
-                    "node_url": lease.node_url,
-                    "image": lease.image,
-                    "base_image": lease.base_image,
-                    "current_image": lease.current_image or lease.image,
-                    "instance_id": lease.instance_id,
-                }
-            )
-            return payload
-
-        for node_url, leases in grouped.items():
-            try:
-                batch_result = _post_exec(
-                    f"{node_url}/container/stats_batch",
-                    {"container_ids": [lease.container_id for _, lease in leases]},
-                    timeout=30,
-                )
-                if not batch_result.get("ok", False):
-                    raise RuntimeError(f"batch stats failed: {batch_result}")
-                by_container = batch_result.get("stats")
-                if not isinstance(by_container, dict):
-                    raise RuntimeError(f"batch stats returned invalid payload: {batch_result}")
-                for lease_id, lease in leases:
-                    item = by_container.get(lease.container_id)
-                    if not isinstance(item, dict):
-                        item = {"ok": False, "error": "missing container stats in batch response"}
-                    stats[lease_id] = _decorate(lease_id, lease, item)
-                continue
-            except Exception as batch_exc:
-                logger.debug("stats_batch failed for node=%s, falling back to per-lease stats: %s", node_url, batch_exc)
-
-            for lease_id, lease in leases:
-                try:
-                    item = _post_exec(
-                        f"{lease.node_url}/container/stats",
-                        {"container_id": lease.container_id},
-                        timeout=30,
-                    )
-                except Exception as exc:
-                    item = {"ok": False, "error": str(exc), "error_code": "stats_unavailable"}
-                stats[lease_id] = _decorate(lease_id, lease, item)
-
-        return {"ok": True, "stats": stats}
-
     def status(self) -> dict[str, Any]:
         with self._lock:
-            base = {
+            return {
                 "total_leases": len(self._leases),
                 "pending_allocations": self._pending_allocations,
                 "max_total_leases": self.max_total_leases,
                 "max_concurrent_allocates": self.max_concurrent_allocates,
                 "allocate_min_interval_sec": self.allocate_min_interval_sec,
                 "create_timeout_sec": self.create_timeout_sec,
+                "nodes": [
+                    {
+                        "url": node.url,
+                        "active_containers": node.active_containers,
+                        "max_containers": node.max_containers,
+                        "healthy": node.healthy,
+                    }
+                    for node in self.nodes
+                ],
+                "leases": [
+                    {
+                        "lease_id": lease.lease_id,
+                        "node_url": lease.node_url,
+                        "container_id": lease.container_id,
+                        "image": lease.image,
+                        "base_image": lease.base_image,
+                        "current_image": lease.current_image or lease.image,
+                        "instance_id": lease.instance_id,
+                        "cwd": lease.cwd,
+                        "generation": lease.generation,
+                        "latest_ready_checkpoint_id": lease.latest_ready_checkpoint_id,
+                        "latest_checkpoint_step_idx": lease.latest_checkpoint_step_idx,
+                        "rerun_count": lease.rerun_count,
+                        "created_at": lease.created_at,
+                        "last_heartbeat": lease.last_heartbeat,
+                        "last_rerun_at": lease.last_rerun_at,
+                    }
+                    for lease in self._leases.values()
+                ],
             }
-            node_snapshots = [
-                {
-                    "url": n.url,
-                    "active_containers": n.active_containers,
-                    "max_containers": n.max_containers,
-                    "healthy": n.healthy,
-                }
-                for n in self.nodes
-            ]
-            lease_snapshots = list(self._leases.values())
-
-        # Query node host stats outside lock to avoid blocking other operations.
-        cluster_total_bytes = 0
-        cluster_available_bytes = 0
-        cluster_free_bytes = 0
-        cluster_cpu_total_percent = 0.0
-        cluster_cpu_available_percent = 0.0
-        cluster_disk_read_total_bps = 0.0
-        cluster_disk_read_available_bps = 0.0
-        cluster_disk_write_total_bps = 0.0
-        cluster_disk_write_available_bps = 0.0
-        nodes: list[dict[str, Any]] = []
-        for node in node_snapshots:
-            memory_total_bytes = 0
-            memory_available_bytes = 0
-            memory_free_bytes = 0
-            cpu_total_percent = 0.0
-            cpu_available_percent = 0.0
-            disk_read_total_bps = 0.0
-            disk_read_available_bps = 0.0
-            disk_write_total_bps = 0.0
-            disk_write_available_bps = 0.0
-            if node["healthy"]:
-                try:
-                    host = _get_exec(f"{node['url']}/host_stats", timeout=5)
-                    if host.get("ok", False):
-                        memory_total_bytes = int(host.get("memory_total_bytes", 0) or 0)
-                        memory_available_bytes = int(host.get("memory_available_bytes", 0) or 0)
-                        memory_free_bytes = int(host.get("memory_free_bytes", 0) or 0)
-                        cpu_total_percent = float(host.get("cpu_total_percent", 0.0) or 0.0)
-                        cpu_available_percent = float(host.get("cpu_available_percent", 0.0) or 0.0)
-                        disk_read_total_bps = float(host.get("disk_read_total_bytes_per_sec", 0.0) or 0.0)
-                        disk_read_available_bps = float(host.get("disk_read_available_bytes_per_sec", 0.0) or 0.0)
-                        disk_write_total_bps = float(host.get("disk_write_total_bytes_per_sec", 0.0) or 0.0)
-                        disk_write_available_bps = float(host.get("disk_write_available_bytes_per_sec", 0.0) or 0.0)
-                except Exception:
-                    # Keep status endpoint robust; health check pipeline handles liveness.
-                    pass
-
-            node_out = {
-                **node,
-                "memory_total_bytes": memory_total_bytes,
-                "memory_available_bytes": memory_available_bytes,
-                "memory_free_bytes": memory_free_bytes,
-                "cpu_total_percent": cpu_total_percent,
-                "cpu_available_percent": cpu_available_percent,
-                "disk_read_total_bytes_per_sec": disk_read_total_bps,
-                "disk_read_available_bytes_per_sec": disk_read_available_bps,
-                "disk_write_total_bytes_per_sec": disk_write_total_bps,
-                "disk_write_available_bytes_per_sec": disk_write_available_bps,
-            }
-            nodes.append(node_out)
-            cluster_total_bytes += max(0, memory_total_bytes)
-            cluster_available_bytes += max(0, memory_available_bytes)
-            cluster_free_bytes += max(0, memory_free_bytes)
-            cluster_cpu_total_percent += max(0.0, cpu_total_percent)
-            cluster_cpu_available_percent += max(0.0, cpu_available_percent)
-            cluster_disk_read_total_bps += max(0.0, disk_read_total_bps)
-            cluster_disk_read_available_bps += max(0.0, disk_read_available_bps)
-            cluster_disk_write_total_bps += max(0.0, disk_write_total_bps)
-            cluster_disk_write_available_bps += max(0.0, disk_write_available_bps)
-
-        return {
-            **base,
-            "cluster_memory_total_bytes": cluster_total_bytes,
-            "cluster_memory_available_bytes": cluster_available_bytes,
-            "cluster_memory_free_bytes": cluster_free_bytes,
-            "cluster_cpu_total_percent": cluster_cpu_total_percent,
-            "cluster_cpu_available_percent": cluster_cpu_available_percent,
-            "cluster_disk_read_total_bytes_per_sec": cluster_disk_read_total_bps,
-            "cluster_disk_read_available_bytes_per_sec": cluster_disk_read_available_bps,
-            "cluster_disk_write_total_bytes_per_sec": cluster_disk_write_total_bps,
-            "cluster_disk_write_available_bytes_per_sec": cluster_disk_write_available_bps,
-            "nodes": nodes,
-            "leases": [
-                {
-                    "lease_id": lease.lease_id,
-                    "node_url": lease.node_url,
-                    "container_id": lease.container_id,
-                    "image": lease.image,
-                    "base_image": lease.base_image,
-                    "current_image": lease.current_image or lease.image,
-                    "instance_id": lease.instance_id,
-                    "cwd": lease.cwd,
-                    "generation": lease.generation,
-                    "latest_ready_checkpoint_id": lease.latest_ready_checkpoint_id,
-                    "latest_checkpoint_step_idx": lease.latest_checkpoint_step_idx,
-                    "rerun_count": lease.rerun_count,
-                    "created_at": lease.created_at,
-                    "last_heartbeat": lease.last_heartbeat,
-                    "last_rerun_at": lease.last_rerun_at,
-                }
-                for lease in lease_snapshots
-            ],
-        }
 
     def health_check(self) -> None:
         for node in self.nodes:
@@ -1118,54 +951,6 @@ def fault_kill():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.post("/stats")
-def stats():
-    if POOL is None:
-        return jsonify({"ok": False, "error": "Pool not initialized"}), 500
-    data = flask_request.get_json(force=True) or {}
-    lease_id = data.get("lease_id")
-    if not lease_id:
-        return jsonify({"ok": False, "error": "lease_id required"}), 400
-    try:
-        result = POOL.stats(lease_id=lease_id)
-        return jsonify(result)
-    except KeyError as e:
-        # Unknown lease is a normal race when sampler checks stats while a lease
-        # is being detached/closed; return app-level error to avoid HTTP retries.
-        return jsonify({"ok": False, "error": str(e), "error_code": "unknown_lease_id", "lease_id": lease_id})
-    except Exception as e:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(e),
-                "error_code": "stats_unavailable",
-                "retryable": False,
-                "lease_id": lease_id,
-            }
-        )
-
-
-@app.post("/stats_batch")
-def stats_batch():
-    if POOL is None:
-        return jsonify({"ok": False, "error": "Pool not initialized"}), 500
-    data = flask_request.get_json(force=True) or {}
-    lease_ids = data.get("lease_ids")
-    if not isinstance(lease_ids, list) or not lease_ids:
-        return jsonify({"ok": False, "error": "lease_ids must be a non-empty list"}), 400
-    try:
-        return jsonify(POOL.stats_batch([str(item) for item in lease_ids]))
-    except Exception as e:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(e),
-                "error_code": "stats_batch_unavailable",
-                "retryable": False,
-            }
-        )
-
-
 @app.post("/checkpoint/probe")
 def checkpoint_probe():
     if POOL is None:
@@ -1314,22 +1099,13 @@ def rerun():
 # ── Main ──────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    sched_enabled = os.getenv("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
     max_total_leases_env = os.getenv("SWE_POOL_MAX_TOTAL_LEASES")
     if max_total_leases_env is not None:
         default_max_total_leases = int(max_total_leases_env)
     else:
-        # Scheduler mode: avoid global hard cap by default.
-        # Non-scheduler mode: keep legacy behavior tied to SWE_MAX_CONCURRENT.
-        default_max_total_leases = 0 if sched_enabled else int(os.getenv("SWE_MAX_CONCURRENT", "0"))
-    default_max_concurrent_allocates = int(
-        os.getenv("SWE_POOL_MAX_CONCURRENT_ALLOCATES", "16" if sched_enabled else "1")
-    )
-    default_allocate_min_interval_sec = float(
-        os.getenv("SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC", "0.05" if sched_enabled else "0.5")
-    )
+        default_max_total_leases = int(os.getenv("SWE_MAX_CONCURRENT", "0"))
+    default_max_concurrent_allocates = int(os.getenv("SWE_POOL_MAX_CONCURRENT_ALLOCATES", "1"))
+    default_allocate_min_interval_sec = float(os.getenv("SWE_POOL_ALLOCATE_MIN_INTERVAL_SEC", "0.5"))
 
     parser = argparse.ArgumentParser(description="SWE environment pool server")
     parser.add_argument("--host", default="0.0.0.0")
@@ -1393,25 +1169,12 @@ def _periodic_health_check(pool: "SweEnvPool", interval: int = 30) -> None:
 def main() -> None:
     global POOL
     args = parse_args()
-    sched_enabled = os.getenv("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s %(levelname)s %(name)s] %(message)s")
-
-    # In online scheduler mode, per-node hard cap is intentionally disabled.
-    # Concurrency is fully decided by the scheduler algorithm.
-    effective_max_containers_per_node = args.max_containers_per_node
-    if sched_enabled and args.max_containers_per_node > 0:
-        logger.info(
-            "Online scheduler enabled: ignoring --max-containers-per-node=%d; using unlimited per-node containers",
-            args.max_containers_per_node,
-        )
-        effective_max_containers_per_node = 0
 
     urls = [u.strip() for u in args.exec_server_urls.split(",") if u.strip()]
     POOL = SweEnvPool(
         exec_server_urls=urls,
-        max_containers_per_node=effective_max_containers_per_node,
+        max_containers_per_node=args.max_containers_per_node,
         max_total_leases=args.max_total_leases,
         max_concurrent_allocates=args.max_concurrent_allocates,
         allocate_min_interval_sec=args.allocate_min_interval_sec,
@@ -1423,7 +1186,7 @@ def main() -> None:
 
     healthy = sum(1 for n in POOL.nodes if n.healthy)
     max_containers_text = (
-        "unlimited" if effective_max_containers_per_node <= 0 else str(effective_max_containers_per_node)
+        "unlimited" if args.max_containers_per_node <= 0 else str(args.max_containers_per_node)
     )
     logger.info(
         "SWE env pool: %d/%d nodes healthy, max %s containers/node, max_total_leases=%d, "

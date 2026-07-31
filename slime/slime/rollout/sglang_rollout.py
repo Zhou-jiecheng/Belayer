@@ -2,7 +2,6 @@ import asyncio
 import copy
 import inspect
 import logging
-import math
 import os
 import time
 from argparse import Namespace
@@ -54,22 +53,6 @@ async def _list_router_worker_urls(args: Namespace) -> list[str]:
     return [worker["url"] for worker in workers]
 
 
-def _online_scheduler_pending_group_target(args: Namespace, target_data_size: int) -> int:
-    target = max(1, int(target_data_size))
-    if os.getenv("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        return target
-
-    multiplier = max(1.0, float(os.getenv("SWE_SCHED_PENDING_GROUP_WINDOW_MULTIPLIER", "2.0")))
-    extra = max(0, int(os.getenv("SWE_SCHED_PENDING_GROUP_WINDOW_EXTRA", "0")))
-    cap = int(os.getenv("SWE_SCHED_PENDING_GROUP_WINDOW_CAP", "0"))
-
-    pending_target = max(target, int(math.ceil(target * multiplier)))
-    pending_target = max(pending_target, target + extra)
-    if cap > 0:
-        pending_target = min(pending_target, cap)
-    return max(target, pending_target)
-
-
 def _rolling_refill_enabled() -> bool:
     return os.getenv("SLIME_ENABLE_ROLLING_OVERSAMPLING_REFILL", "0").strip().lower() not in {
         "0",
@@ -80,18 +63,12 @@ def _rolling_refill_enabled() -> bool:
 
 
 def _effective_pending_group_target(args: Namespace, target_data_size: int, rolling_refill_enabled: bool) -> int:
-    pending_group_target = _online_scheduler_pending_group_target(args, target_data_size)
+    target = max(1, int(target_data_size))
     requested_group_window = max(1, int(getattr(args, "over_sampling_batch_size", target_data_size)))
 
     if rolling_refill_enabled:
-        return max(pending_group_target, requested_group_window)
-
-    # When the caller explicitly disables refill and keeps oversampling equal to the
-    # target batch, do not let the online scheduler silently widen the pending window.
-    if requested_group_window <= target_data_size:
-        return target_data_size
-
-    return pending_group_target
+        return max(target, requested_group_window)
+    return target
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -108,19 +85,7 @@ class GenerateState(metaclass=SingletonMeta):
         base_concurrency = (
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
-        if os.getenv("SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER", "").strip().lower() in {"1", "true", "yes", "on"}:
-            # Let online scheduler + SWE-side limiter decide effective in-flight requests.
-            # This avoids an unrelated sglang semaphore (often ~128) becoming the hard cap.
-            scheduler_mode_concurrency = int(os.getenv("SWE_SCHED_INTERNAL_MAX_INFLIGHT", "4096"))
-            sem_concurrency = max(base_concurrency, scheduler_mode_concurrency)
-            logger.info(
-                "GenerateState semaphore override (online scheduler): base=%d -> effective=%d",
-                base_concurrency,
-                sem_concurrency,
-            )
-        else:
-            sem_concurrency = base_concurrency
-        self.semaphore = asyncio.Semaphore(max(1, sem_concurrency))
+        self.semaphore = asyncio.Semaphore(max(1, base_concurrency))
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,

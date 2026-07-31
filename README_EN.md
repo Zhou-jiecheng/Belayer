@@ -6,13 +6,12 @@ English | [中文](README.md)
 
 **Runtime environment**: the official slime image `slime/slime:v0.2.2`.
 
-Belayer is built on [slime](slime/), [SGLang](sglang/), [Megatron-LM](Megatron-LM/), and remote Docker-based SWE environments. Its goal is to reduce the blast radius of failures and avoid repeated computation during long-running, multi-turn, heterogeneous LLM RL rollouts. Instead of handling every problem by restarting the entire job, the system addresses environment state loss, resource pressure, and inference-service interruptions separately, as close as possible to where each failure occurs.
+Belayer is built on [slime](slime/), [SGLang](sglang/), [Megatron-LM](Megatron-LM/), and remote Docker-based SWE environments. Its goal is to reduce the blast radius of failures and avoid repeated computation during long-running, multi-turn, heterogeneous LLM RL rollouts. Instead of handling every problem by restarting the entire job, the system addresses environment state loss and inference-service interruptions separately, as close as possible to where each failure occurs.
 
-The project currently focuses on three designs:
+The project currently focuses on two designs:
 
 1. **Env checkpoint**: By default, Docker-managed CRIU checkpoints and overlay upperdir snapshots jointly preserve container process/memory state and the filesystem. The original `docker commit + runtime.json` legacy backend is retained. The currently integrated explicit fault-injection path can continue from the latest safe point; natural OOMs, transport errors, and ordinary exec exceptions do not yet share a unified automatic-rerun path.
-2. **Env workload-aware scheduling**: Four-dimensional admission control and dynamic reordering use historical workload profiles together with the cluster's current residual resources to smooth load before OOMs, CPU/I/O contention, and Docker create storms occur.
-3. **Rollout engine instant restart**: Shadow workers are started ahead of time for SGLang rollout engines. When a primary fails, a shadow quickly takes over, including endpoint switching and reconnection for subsequent weight updates. When the custom SlimeRouter is enabled, in-flight streaming generations can also continue.
+2. **Rollout engine instant restart**: Shadow workers are started ahead of time for SGLang rollout engines. When a primary fails, a shadow quickly takes over, including endpoint switching and reconnection for subsequent weight updates. When the custom SlimeRouter is enabled, in-flight streaming generations can also continue.
 
 This document describes only the current implementation under `Belayer/`. Existing design documents explain the background, but where they differ from the code, the current code behavior takes precedence.
 
@@ -24,12 +23,11 @@ A single Agentic RL rollout spans three kinds of state:
 - **Environment-execution state**: the Docker filesystem, code changes, installed dependencies, the current working directory, and the Python environment;
 - **Rollout-control state**: conversation messages, the step cursor, reward/PRM tasks, and samples not yet written to the training buffer.
 
-These state classes have different lifetimes and recovery costs. A training-model checkpoint alone cannot restore completed changes under `/testbed`; restoring only a Docker container cannot automatically continue a disconnected generation; restarting only a rollout engine cannot prevent host OOMs caused by many heterogeneous environments starting simultaneously. Belayer therefore decomposes fault tolerance into three complementary loops:
+These state classes have different lifetimes and recovery costs. A training-model checkpoint alone cannot restore completed changes under `/testbed`, and restoring only a Docker container cannot automatically continue a disconnected generation. Belayer therefore decomposes fault tolerance into two complementary loops:
 
 | Layer | Primary failure or pressure | Core mechanism | Protection granularity |
 |---|---|---|---|
 | Environment state | Container termination or lost environment progress | Docker env checkpoint; rerun for explicit fault injection | One lease, one trajectory step |
-| Environment capacity | Memory/CPU/disk overload or startup storms | Workload profile + budgeted admission | One prompt, one cluster resource window |
 | Rollout serving | SGLang primary process exits or becomes unreachable | Shadow handover + router recovery | One engine group, one generation |
 
 Three different uses of the word "checkpoint" are easy to confuse:
@@ -54,7 +52,6 @@ flowchart TB
     Primary[SGLang primary workers]
     Shadow[SGLang skeleton shadow workers]
 
-    Scheduler[workload-aware admission]
     Client[SweEnvClient]
     Pool[SWE env pool server]
     Exec[SWE exec server nodes]
@@ -70,13 +67,12 @@ flowchart TB
     Primary -. process failure .-> Shadow
     Shadow -->|register new URL and take over| Router
 
-    Rollout --> Scheduler
-    Scheduler --> Client --> Pool --> Exec --> Env
+    Rollout --> Client --> Pool --> Exec --> Env
     Env -->|safe action boundary| EnvCkpt
     EnvCkpt -->|rerun on original node| Env
 ```
 
-The main data path is as follows: the training actor updates the active rollout engine through weight-update communication; under fast-restart configuration, checkpoint-engine provides persistent shared weight backing and recovery loading for primary and shadow workers; rollouts invoke SGLang through the router and operate remote Docker environments through `SweEnvClient`; once an environment action completes, its observation feeds the next LLM generation. The three fault-tolerance designs are inserted at different points along this path, so a local failure does not necessarily stop the entire training job.
+The main data path is as follows: the training actor updates the active rollout engine through weight-update communication; under fast-restart configuration, checkpoint-engine provides persistent shared weight backing and recovery loading for primary and shadow workers; rollouts invoke SGLang through the router and operate remote Docker environments through `SweEnvClient`; once an environment action completes, its observation feeds the next LLM generation. The two fault-tolerance designs are inserted at different points along this path, so a local failure does not necessarily stop the entire training job.
 
 ## 3. Design One: Env Checkpoint
 
@@ -168,86 +164,9 @@ Main implementation:
 - [`swe-rl/server/swe_env_pool_server.py`](swe-rl/server/swe_env_pool_server.py)
 - [`swe-rl/server/swe_exec_server.py`](swe-rl/server/swe_exec_server.py)
 
-## 4. Design Two: Env Workload-Aware Scheduling
+## 4. Design Two: Rollout Engine Instant Restart and Router Recovery
 
-### 4.1 Role of the Design
-
-The workload-aware scheduler is a **prompt-level resource admission controller** within a single rollout Python process. It uses aggregate cluster budgets to decide which prompt may begin consuming Docker-environment resources; the pool server still decides which node will host a particular container.
-
-This mechanism primarily prevents failures rather than recovering after them. By limiting aggregate resource demand and the Docker creation rate, it reduces the likelihood of host OOMs, CPU/I/O congestion, dockerd instability, and simultaneous cold starts by many unknown workloads.
-
-### 4.2 Workload Profiles
-
-Scheduling uses a four-dimensional resource vector:
-
-```text
-R = (peak memory, average CPU, disk read, disk write)
-```
-
-Although some variables still use names such as `repo_resource_stats`, current profiles are actually keyed by **per-data / instance_id**. The repository is used primarily for display and as a fallback when `instance_id` is missing. Consequently, a new instance from the same repository may still take the cold-start path rather than inheriting the repository's profile automatically.
-
-Profiles come from two sources:
-
-- **Offline replay profiles**: replay historical trajectories and read each instance's memory peak, average CPU usage, cumulative disk I/O, and duration;
-- **Online lease stats**: route batch stats through the pool to exec nodes and collect cgroup memory/CPU/I/O. Online updates and persistence are optional switches and are not enabled by every launcher by default.
-
-When there is insufficient history, the scheduler multiplies the default prediction by cold-start memory/CPU multipliers and uses an unknown-workload concurrency cap to limit bursts.
-
-### 4.3 Real-Time Budgets and Admission
-
-Each exec node reports available memory, CPU capacity, and estimated disk bandwidth through `/host_stats`; the pool's `/status` aggregates healthy nodes into cluster-wide availability. The effective budget in each resource dimension is:
-
-```text
-budget[d] = cluster_available[d]
-          × safety_margin
-          × oversell_ratio[d]
-```
-
-To compensate for lag in live sampling, the scheduler also subtracts predicted resources already reserved by prompts admitted in the current process. A new prompt can start only if memory, CPU, disk read, and disk write all fit within their budgets, and if the active, startup, unknown-workload, and per-refresh-window admission caps are all respected.
-
-If a single workload exceeds the entire budget and no prompt is active, the scheduler forcibly admits the oldest oversized prompt to prevent a permanent queue deadlock.
-
-### 4.4 Dynamic Reordering
-
-When input order is not enforced, the scheduler selects the highest packing score among all pending prompts that fit:
-
-```text
-score = four-dimensional residual fill
-      + 0.6 × dominant-resource ratio
-      + 0.4 × age bonus
-```
-
-The duration bonus and unknown penalty present in the current code have not yet been incorporated into the actual score. When preserve-order is enabled, the head of the queue is checked first; after repeatedly being blocked by the budget, it may be moved back to reduce head-of-line blocking.
-
-The rollout maintains a sufficiently large pending window and submits candidates in grouped breadth-first order, allowing the scheduler to combine workloads with different resource shapes into multiple execution waves. Docker create operations also have independent concurrency and minimum-interval rate limits so admission does not simply produce another startup storm.
-
-### 4.5 Feedback Loop and Recovery Coordination
-
-After a prompt receives an admission ticket, both its agent lease and subsequent evaluation lease are associated with that ticket. When the prompt completes or exits exceptionally, a `finally` path closes the leases, releases semaphores and resource reservations, and may update the profile from a sampled summary. If a task is canceled while waiting for admission, there is currently no matching cleanup for the pending request.
-
-An env-checkpoint rerun keeps the same `lease_id` and replaces only the `container_id` in the pool. The scheduler therefore continues to read stats through the same lease; a single container recovery neither requires readmission nor breaks prompt-level resource accounting.
-
-### 4.6 Current Boundaries
-
-- Four-dimensional admission uses a **cluster aggregate**. Pool placement merely chooses the healthy node with the fewest `active_containers`; it is not per-node resource bin packing.
-- The scheduler is a singleton within one Python process. Multiple rollout processes do not share strongly consistent global reservations and coordinate only indirectly through the pool's `/status`, which has sampling delay.
-- Disk workload profiles represent cumulative bytes, while host budgets are expressed in bytes per second. The current comparison is heuristic rather than strict resource isolation.
-- The current key is an instance and does not provide repository-level generalization. If production configurations disable live profile updates, instances outside the offline profile continue to use cold-start predictions.
-- Admission exceptions fail open to legacy order. Internal semaphores are usually large in scheduler mode, so monitoring this degradation path is important.
-- Canceling a task that is waiting for admission can leave behind a pending request; this cleanup path remains to be implemented.
-- `plan_prompt_order()` is an offline helper. Actual production reordering comes from online admission candidate selection.
-
-Main implementation:
-
-- [`swe-rl/online_env_docker_scheduler.py`](swe-rl/online_env_docker_scheduler.py)
-- [`swe-rl/generate_with_swe_remote.py`](swe-rl/generate_with_swe_remote.py)
-- [`swe-rl/server/swe_env_pool_server.py`](swe-rl/server/swe_env_pool_server.py)
-- [`swe-rl/server/swe_exec_server.py`](swe-rl/server/swe_exec_server.py)
-- [`slime/slime/rollout/sglang_rollout.py`](slime/slime/rollout/sglang_rollout.py)
-
-## 5. Design Three: Rollout Engine Instant Restart and Router Recovery
-
-### 5.1 Meaning of Instant Restart
+### 4.1 Meaning of Instant Restart
 
 The instant-restart fast path does not launch a complete SGLang engine from disk after a failure. Instead, it starts a `skeleton_worker` shadow in advance for every local regular rollout engine:
 
@@ -260,7 +179,7 @@ The parameter/weight and KV sidecars share GPU buffers, not the complete control
 
 "Instant" therefore means avoiding a model cold load and most initialization overhead, not strictly zero delay or seamless migration of process memory.
 
-### 5.2 Two-Level Failure Detection and Handover
+### 4.2 Two-Level Failure Detection and Handover
 
 The fast path has two levels of detection:
 
@@ -280,7 +199,7 @@ Promotion uses a lock and pending event so repeated calls by the watcher and hea
 
 A multi-node group handover initiated by the health monitor requires promotion to succeed on every node in the group; otherwise it falls back to a complete engine restart. The actor-local watcher's crash fast path currently takes over nodes independently, without a group barrier.
 
-### 5.3 Router Worker-Incarnation Management
+### 4.3 Router Worker-Incarnation Management
 
 The custom `SlimeRouter` uses a stable logical key for every engine node:
 
@@ -294,7 +213,7 @@ New requests choose the worker with the fewest active requests, breaking ties wi
 
 These stable-key and token-level semantics belong only to the `--use-slime-router` path. That switch is disabled by default in the bare code and is not enabled by default in the current SWE integration launcher; only fault-tolerance smoke scripts enable it explicitly. Shadow handover can therefore still switch endpoints when used with the standard `sglang-router`, but the token-continuation behavior below is opt-in. The standard router provides its own health checks and whole-request retries, but not SlimeRouter's in-process token checkpoints.
 
-### 5.4 Recovery of In-Flight Generations
+### 4.4 Recovery of In-Flight Generations
 
 For streaming `/generate`, SlimeRouter consumes upstream SSE and accumulates:
 
@@ -315,13 +234,13 @@ When the custom router is enabled, a failed request waits by default for a highe
 
 Token checkpoints exist only in router memory and are lost if the router process itself exits.
 
-### 5.5 Reconnection at the Next Weight Update
+### 4.5 Reconnection at the Next Weight Update
 
 After shadow promotion, the old primary's NCCL/IPC weight-update control group is invalid. Every engine actor records a one-shot reconnect event. The RolloutManager collects and deduplicates these by engine group during the next `get_rollout_engines_and_lock()` call and includes them in `num_new_engines`.
 
 The Megatron/FSDP actor rebuilds weight-update connections before actually pushing the next weight version. It consumes events using decrement-and-ack semantics only after reconnection succeeds, so a handover arriving during reconnection is not erased by clearing an entire table. Reconnection occurs at the **next weight update**, not on the synchronous handover critical path.
 
-### 5.6 Degradation Paths and Current Boundaries
+### 4.6 Degradation Paths and Current Boundaries
 
 - When no shadow is available, the health monitor suppresses the affected group, kills the old Ray actors, recreates the engine in the original placement group, and then removes suppression.
 - When fast restart is disabled, some single-node failures can obtain weights from a healthy engine through the remote-instance loader; if the seed is unhealthy, recovery falls back to storage loading.
@@ -341,26 +260,23 @@ Main implementation:
 - [`checkpoint-engine/`](checkpoint-engine/)
 - [`sglang/`](sglang/)
 
-## 6. How the Three Designs Work Together
+## 5. How the Two Designs Work Together
 
 A normal agent step can be summarized as follows:
 
-1. The workload-aware scheduler uses the instance profile and cluster budget to decide whether the prompt may start.
-2. The rollout requests an LLM through the router and executes the resulting action in a remote Docker environment.
-3. After the action completes, the checkpoint policy may save this safe environment state during the next LLM wait.
-4. If the SGLang primary exits during generation, the shadow takes over the endpoint. With the custom SlimeRouter enabled, generation can also continue from a retained token prefix, without rebuilding the Docker environment.
-5. If one of the currently integrated explicit Docker-environment faults is triggered before or during an action, the rollout rolls back to the latest env checkpoint; the router/engine need not restart with it.
-6. When the prompt finishes, its scheduler reservation is released and resource observations are fed back into the profile.
+1. The rollout requests an LLM through the router and executes the resulting action in a remote Docker environment.
+2. After the action completes, the checkpoint policy may save this safe environment state during the next LLM wait.
+3. If the SGLang primary exits during generation, the shadow takes over the endpoint. With the custom SlimeRouter enabled, generation can also continue from a retained token prefix, without rebuilding the Docker environment.
+4. If one of the currently integrated explicit Docker-environment faults is triggered before or during an action, the rollout rolls back to the latest env checkpoint; the router/engine need not restart with it.
 
-This establishes three different bounds on lost work:
+This establishes two different bounds on lost work:
 
-- The scheduler attempts to prevent resource overload from losing an entire batch of concurrent tasks;
 - Env checkpoints limit repeated environment work to actions after the latest safe boundary;
 - With the custom SlimeRouter enabled, router token checkpoints limit repeated in-flight generation to tokens after the latest retained prefix. The standard-router path still uses its whole-request retry behavior.
 
-The three protection mechanisms operate at different state granularities and depend on different surviving control-plane components. Environment recovery requires the rollout Python state to remain alive; optional token continuation requires the custom SlimeRouter to remain alive; training-job recovery still depends on Megatron/FSDP training checkpoints.
+The two protection mechanisms operate at different state granularities and depend on different surviving control-plane components. Environment recovery requires the rollout Python state to remain alive; optional token continuation requires the custom SlimeRouter to remain alive; training-job recovery still depends on Megatron/FSDP training checkpoints.
 
-## 7. Configuration Entry Points
+## 6. Configuration Entry Points
 
 | Mechanism | Key entry points |
 |---|---|
@@ -368,20 +284,19 @@ The three protection mechanisms operate at different state granularities and dep
 | Full checkpoint | `SWE_FULL_CHECKPOINT_PROJECT_ROOT`, `SWE_FULL_CHECKPOINT_STATE_ROOT`, `SWE_FULL_CHECKPOINT_DOCKER_ROOT`, `SWE_FULL_CHECKPOINT_RUNTIME_STAGING_ROOT`, `SWE_FULL_CHECKPOINT_CRIU_TIMEOUT_SEC` |
 | Checkpoint HTTP deadline | Client: `SWE_CHECKPOINT_CREATE_HTTP_TIMEOUT_SEC`, `SWE_CHECKPOINT_RESUME_HTTP_TIMEOUT_SEC`; pool→exec: `SWE_CHECKPOINT_CREATE_FORWARD_TIMEOUT_SEC` |
 | Adaptive policy | `SWE_ADAPTIVE_TAIL_ROOT`, `SWE_ADAPTIVE_FAILURE_PROB`, `SWE_ADAPTIVE_CHECKPOINT_BUDGET_SEC`, and minimum step/cost intervals |
-| Workload scheduler | `SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER` plus `SWE_SCHED_*` profile, budget, oversell, cold-start, and sampling settings |
 | Engine fault tolerance | `--use-fault-tolerance`, health-check interval/timeout/first-wait |
 | Shadow fast restart | `--sglang-enable-fast-restart`, KV socket, weight-server base port, GPU mapping, ready/stabilization timeout |
 | SlimeRouter recovery | `--use-slime-router` plus `SLIME_ROUTER_GENERATE_*`, reroute, and token-recovery settings |
 
 Launcher filenames are not a substitute for checking the effective configuration. Some current wrappers named `adaptive_checkpoint` or `static_checkpoint` may still default the policy to `never`. Before running an experiment, inspect the final exported environment variables and CLI arguments.
 
-## 8. Repository Structure and Suggested Reading Order
+## 7. Repository Structure and Suggested Reading Order
 
 ```text
 Belayer/
 ├── docker-full-checkpoint/ # Git submodule; Docker-managed CRIU + upperdir checkpoint/resume
 ├── slime/              # RL orchestration, RolloutManager, health monitor, router, fast restart
-├── swe-rl/             # SWE agent rollout, remote Docker, env checkpoint, workload scheduler
+├── swe-rl/             # SWE agent rollout, remote Docker, env checkpoint
 ├── checkpoint-engine/  # Fast loading and update service for inference weights
 ├── sglang/             # SGLang runtime, skeleton worker, shared KV/weight support
 ├── Megatron-LM/        # Distributed training backend
@@ -392,16 +307,16 @@ Belayer/
 
 Suggested reading order:
 
-1. This document, for the overall relationship among the three fault-tolerance layers;
+1. This document, for the overall relationship between the two fault-tolerance layers;
 2. [`swe-rl/docs/cn/SWE_ENV_CHECKPOINT_DESIGN.md`](swe-rl/docs/cn/SWE_ENV_CHECKPOINT_DESIGN.md), for the design background of env checkpoints;
 3. [`swe-rl/docs/swe_runtime_memory_recovery_plan.md`](swe-rl/docs/swe_runtime_memory_recovery_plan.md), for the boundary between filesystem and runtime state;
 4. [`swe-rl/docs/cn/SWE_CHECKPOINT_DEBUG_WORKFLOW.md`](swe-rl/docs/cn/SWE_CHECKPOINT_DEBUG_WORKFLOW.md), for checkpoint replay and fault experiments;
 5. [`slime/docs/fast_restart.md`](slime/docs/fast_restart.md), for a summary of shadow fast restart;
 6. The current implementation files and tests listed in each section above.
 
-Note that the env-checkpoint design document still retains the earlier "asynchronous create + status/probe" design, while the current implementation uses synchronous create. The scheduler granularity, default budgets, and configuration entries in `swe-rl/README.md` have also drifted in places. Confirm old documentation against the current code.
+Note that the env-checkpoint design document still retains the earlier "asynchronous create + status/probe" design, while the current implementation uses synchronous create. Confirm old documentation against the current code.
 
-## 9. Validation and Experiment Assets
+## 8. Validation and Experiment Assets
 
 Env checkpoint:
 
@@ -413,13 +328,6 @@ Env checkpoint:
 - [`swe-rl/tools/validate_swe_checkpoint_correctness.py`](swe-rl/tools/validate_swe_checkpoint_correctness.py)
 - [`swe-rl/tools/replay_swe_checkpoint_fault_experiment.py`](swe-rl/tools/replay_swe_checkpoint_fault_experiment.py)
 
-Workload scheduler:
-
-- [`swe-rl/tests/test_online_env_docker_scheduler.py`](swe-rl/tests/test_online_env_docker_scheduler.py)
-- [`swe-rl/tools/replay_swe_online_scheduler_experiment.py`](swe-rl/tools/replay_swe_online_scheduler_experiment.py)
-- [`swe-rl/tools/analyze_prompt_memory_prediction_accuracy.py`](swe-rl/tools/analyze_prompt_memory_prediction_accuracy.py)
-- [`swe-rl/scripts/monitor_container_resource_accuracy.py`](swe-rl/scripts/monitor_container_resource_accuracy.py)
-
 Instant restart and router:
 
 - [`slime/tests/test_fast_restart.py`](slime/tests/test_fast_restart.py)
@@ -427,9 +335,9 @@ Instant restart and router:
 - [`slime/scripts/fault_tolerance/`](slime/scripts/fault_tolerance/)
 - [`sglang/test/manual/test_shadow_worker_handover.py`](sglang/test/manual/test_shadow_worker_handover.py)
 
-The current repository has some test drift: scheduler fixtures still pass removed static-budget fields, and several fast-restart mocks no longer match the current health API. These files represent existing coverage intent and experiment entry points, but the entire test directory should not be assumed to be green today.
+The current repository has some test drift: several fast-restart mocks no longer match the current health API. These files represent existing coverage intent and experiment entry points, but the entire test directory should not be assumed to be green today.
 
-## 10. Current Fault-Tolerance Boundary
+## 9. Current Fault-Tolerance Boundary
 
 Belayer currently protects primarily the rollout and environment data plane; it is not yet a complete job-level high-availability system:
 
@@ -437,7 +345,6 @@ Belayer currently protects primarily the rollout and environment data plane; it 
 - Ray head, router, pool server, checkpoint-engine, KV sidecar, and whole-node failures require additional service-level redundancy;
 - Env checkpoints cannot restore cross-node state, external volumes, or irreversible remote side effects;
 - Shadow handover does not guarantee bitwise-deterministic sampling and cannot handle simultaneous loss of both primary and shadow;
-- The scheduler provides heuristic admission rather than strict resource isolation; per-container cgroup limits are configured independently by the exec server;
 - Classification of natural failures, automatic recovery triggers, cross-node checkpoints, automatic GC/disk governance, and end-to-end consistency validation remain priorities for further engineering.
 
-Belayer is therefore most accurately described as a **layered fault-tolerance prototype and experimentation platform built around the critical path of LLM RL rollouts**. It already provides environment-level rollback for explicit fault-injection paths, resource-aware admission, rapid inference-engine takeover, and optional request-level continuation through the custom SlimeRouter path, while retaining the interfaces and validation tools needed to extend these local recovery loops into a job-level high-availability system.
+Belayer is therefore most accurately described as a **layered fault-tolerance prototype and experimentation platform built around the critical path of LLM RL rollouts**. It already provides environment-level rollback for explicit fault-injection paths, rapid inference-engine takeover, and optional request-level continuation through the custom SlimeRouter path, while retaining the interfaces and validation tools needed to extend these local recovery loops into a job-level high-availability system.

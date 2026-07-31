@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SWE-RL static-concurrency baseline (256), checkpoint disabled, on 4 nodes / 32 GPUs.
-# Scheduler should inject:
+# Multinode launcher should provide:
 #   MLP_ROLE_INDEX=0/1/2/3
 #   MLP_WORKER_0_HOST=<head_ip>
 #   MLP_WORKER_1_HOST=<worker1_ip>

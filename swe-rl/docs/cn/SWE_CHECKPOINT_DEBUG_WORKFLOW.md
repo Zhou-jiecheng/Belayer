@@ -343,19 +343,21 @@ export/checkpoint_policy_fault_experiment_<timestamp>/
 当前 `adaptive-risk` 的设计重点：
 
 - 在 LLM bubble 内做决策，不是在 step 末尾统一决策
-- `redo_cost_sec` 只统计已经执行过的 `exec_elapsed_sec`
-- 不把 `llm_delay` 算入 redo cost
-- `p_fail` 固定为 `1%`
-- checkpoint budget 近似为 `7s`
-- 使用经验 conditional tail 来估计 LLM bubble 剩余时间
+- `C` 统计最近 ready checkpoint 之后已完成的 LLM response 和 environment action 重生成成本
+- `p_fail` 使用配置的 step-level failure probability
+- checkpoint duration `c` 使用当前配置/预测的 checkpoint 时间
+- 使用经验条件生存函数 `q(x;u)=P(T>x+u | T>x)` 估计 LLM bubble 剩余时间
+- 期望收益为 `B=p_fail*C`，不再乘以“整个 checkpoint 被 bubble 覆盖”的概率下界
+- 可见开销为 `O=∫_0^c [1-q(x;u)]du`；经验分布实现对该积分做精确求值
 - `one probe per bubble`
 
 也就是：
 
 1. 当前 step 进入 LLM wait
 2. 根据已经等待的时间 `x`
-3. 计算当前做 checkpoint 的期望收益和期望暴露开销
-4. 如果收益大于开销，则在该 bubble 内最多 probe 一次
+3. 计算期望收益 `B=p_fail*C`
+4. 计算期望可见开销 `O=∫_0^c [1-q(x;u)]du`
+5. 如果 `B>=O`，则在该 bubble 内最多 probe 一次
 
 ## 7. Docker Error Debug Workflow
 

@@ -5,7 +5,6 @@
 # - no shadow worker
 # - no slime router
 # - no env checkpoint
-# - no online scheduler
 # - no fault injection
 
 set -euo pipefail
@@ -32,7 +31,6 @@ export TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-8}"
 
 export STATIC_MAX_CONCURRENCY="${STATIC_MAX_CONCURRENCY:-256}"
 export SWE_CHECKPOINT_POLICY="${SWE_CHECKPOINT_POLICY:-adaptive-risk}"
-export SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER="${SWE_ENABLE_ONLINE_ENV_DOCKER_SCHEDULER:-0}"
 export SWE_FAULT_INJECTION_ENABLE="${SWE_FAULT_INJECTION_ENABLE:-0}"
 
 exec "${SCRIPT_DIR}/run_swe_rl_static_baseline_multinode.sh" "$@"
